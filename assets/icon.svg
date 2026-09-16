@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Original Beauty Wallet mark. Source of the generated PNG and ICO assets. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="violet" x1="52" y1="24" x2="460" y2="506" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9974d7"/>
+      <stop offset="0.5" stop-color="#8061c5"/>
+      <stop offset="1" stop-color="#6848ae"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="64" y1="0" x2="430" y2="512" gradientUnits="userSpaceOnUse">
+      <stop stop-color="white" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="white" stop-opacity="0.02"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="496" height="496" rx="122" fill="url(#violet)"/>
+  <rect x="11" y="11" width="490" height="490" rx="119" stroke="url(#rim)" stroke-width="6"/>
+  <g transform="translate(45 40) scale(13.2)" stroke="#fffefa" stroke-width="2.15" stroke-linecap="round">
+    <path d="M25 10a12 12 0 1 0 1 10"/>
+    <path d="M23 13a7.3 7.3 0 1 0-1 9"/>
+    <path d="M19.5 14a3.4 3.4 0 1 0 .2 4"/>
+  </g>
+  <circle cx="388.2" cy="304" r="24.5" fill="#d2ef9b"/>
+</svg>

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+tmp/
+test-results/
+playwright-report/
+*.log
+.env
+config.json
+wallet*.json
+!test/fixtures/**
+__pycache__/
+.venv/
+.claims-venv/
+helpers/bin/

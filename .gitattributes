@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+# The consensus trust bundle is hash-pinned: never rewrite its bytes on checkout.
+*.pem text eol=lf
+*.png binary
+*.ico binary
