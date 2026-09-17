@@ -116,6 +116,57 @@ test('incomplete stream reports failure and does not claim a complete block', as
   finally { await server.close(); }
 });
 
+test('incomplete stream diagnostics preserve numeric server classifications without untrusted text or data', async () => {
+  const events = [];
+  const server = await mock((request, socket) => socket.write([
+    response(request, { stream_id: 'failed-stream' }),
+    note('stream.chunk', { stream_id: 'failed-stream', sequence: 0, items: { type: 'snapshot' } }),
+    note('stream.end', { stream_id: 'failed-stream', chunks: 1, complete: false,
+      error: { code: -32001, message: 'untrusted-private-message',
+        data: { node_code: -26, address: 'untrusted-private-address', transaction_hex: 'untrusted-private-transaction' } } }),
+  ].map(line).join('')), { onDiagnostic: (event, details) => events.push({ event, details }) });
+  try {
+    await assert.rejects(server.client.request('getblockbounties', { block_hash: hash }, { onChunk() {} }), error => {
+      assert.equal(error.message, 'Bounty stream was incomplete; nothing from this block was applied.');
+      assert.equal(error.code, undefined);
+      return true;
+    });
+    const failures = events.filter(item => item.event === 'rpc.failed');
+    assert.equal(failures.length, 1);
+    const { details } = failures[0];
+    assert.equal(details.method, 'getblockbounties');
+    assert.equal(details.stage, 'stream');
+    assert.equal(details.unknownOutcome, false);
+    assert.equal(details.error.code, -32001);
+    assert.deepEqual(details.error.data, { node_code: -26 });
+    assert.equal(details.error.message, 'Bounty stream was incomplete; nothing from this block was applied.');
+    assert.equal(JSON.stringify(events).includes('untrusted-private-'), false);
+    assert.equal(server.client.pending.size, 0);
+    assert.equal(server.client.streams.size, 0);
+    assert.equal(server.client.socket?.destroyed ?? true, true);
+  } finally { await server.close(); }
+});
+
+test('incomplete stream diagnostics ignore nonnumeric or unsafe server classifications', async () => {
+  for (const error of [
+    { code: '-32001', data: { node_code: -26 } },
+    { code: Number.MAX_SAFE_INTEGER + 1, data: { node_code: -26 } },
+    { code: -32001, data: { node_code: '-26' } },
+  ]) {
+    const events = [];
+    const server = await mock((request, socket) => socket.write([
+      response(request, { stream_id: 'invalid-code' }),
+      note('stream.end', { stream_id: 'invalid-code', chunks: 0, complete: false, error }),
+    ].map(line).join('')), { onDiagnostic: (event, details) => events.push({ event, details }) });
+    try {
+      await assert.rejects(server.client.request('getblockbounties', { block_hash: hash }, { onChunk() {} }), /incomplete/);
+      const failure = events.find(item => item.event === 'rpc.failed').details.error;
+      assert.equal(failure.code, Number.isSafeInteger(error.code) ? error.code : undefined);
+      assert.equal(failure.data, undefined);
+    } finally { await server.close(); }
+  }
+});
+
 test('invalid envelopes, UTF8, and oversized unframed messages fail closed', async () => {
   for (const malformed of [
     request => line({ jsonrpc: '2.0', id: request.id, result: 1, error: { code: -1, message: 'bad' } }),
@@ -186,4 +237,134 @@ test('queued parameters are snapshotted, close aborts pace waiters, connection-c
     race.client.once('connected', () => race.client.close());
     await assert.rejects(bounded(race.client.request('getchaintip')), /closed/);
   } finally { await race.close(); }
+});
+
+test('diagnostic callbacks cannot fail requests or replace RPC errors', async () => {
+  for (const onDiagnostic of [() => { throw new Error('sink failed'); }, async () => { throw new Error('async sink failed'); }]) {
+    const server = await mock((request, socket, requests) => socket.write(line(requests.length === 1
+      ? response(request, true)
+      : { jsonrpc: '2.0', id: request.id, error: { code: -32020, message: 'Rejected', data: { node_code: -26 } } })), { onDiagnostic });
+    try {
+      assert.equal(await server.client.request('getchaintip'), true);
+      await assert.rejects(server.client.request('getchaintip'), error => error instanceof RpcError && error.code === -32020 && error.data.node_code === -26);
+      await delay(0);
+      assert.equal(server.client.pending.size, 0);
+    } finally { await server.close(); }
+  }
+});
+
+test('diagnostics record RPC error metadata without request params or endpoint details', async () => {
+  const events = [];
+  const server = await mock((request, socket) => socket.write(line({ jsonrpc: '2.0', id: request.id,
+    error: { code: -32020, message: 'Rejected', data: { node_code: -26 } } })), { onDiagnostic: (event, details) => events.push({ event, details }) });
+  const params = [
+    ['getaddressbalance', { address: 'tcc1pPrivateAddressNeverLog12345' }],
+    ['gettransaction', { txid: hash }],
+    ['sendrawtransaction', { transaction_hex: 'cafe'.repeat(50) }],
+  ];
+  try {
+    for (const [method, value] of params) await assert.rejects(server.client.request(method, value), error => error.code === -32020);
+    const failures = events.filter(item => item.event === 'rpc.failed');
+    assert.deepEqual(failures.map(item => item.details.method), params.map(([method]) => method));
+    for (const { details } of failures) {
+      assert.deepEqual(Object.keys(details).sort(), ['durationMs', 'error', 'method', 'stage', 'unknownOutcome']);
+      assert.equal(details.stage, 'request');
+      assert.equal(details.unknownOutcome, false);
+      assert.ok(details.durationMs >= 0);
+      assert.ok(details.error instanceof RpcError);
+      assert.equal(details.error.code, -32020);
+      assert.equal(details.error.data.node_code, -26);
+    }
+    const serialized = JSON.stringify(events);
+    for (const [, value] of params) for (const secret of Object.values(value)) assert.equal(serialized.includes(secret), false);
+    assert.equal(serialized.includes('127.0.0.1'), false);
+    assert.equal(events.filter(item => item.event === 'rpc.connected').length, 1);
+    assert.equal(events.some(item => item.event === 'rpc.slow'), false);
+  } finally { await server.close(); }
+  await delay(0);
+  assert.equal(events.filter(item => item.event === 'rpc.disconnected').length, 1);
+});
+
+test('transport diagnostics retain the timeout cause and unknown broadcast outcome without retrying', async () => {
+  const events = [];
+  const server = await mock(() => {}, { timeoutMs: 30, onDiagnostic: (event, details) => events.push({ event, details }) });
+  try {
+    await assert.rejects(server.client.request('sendrawtransaction', { transaction_hex: 'ab'.repeat(40) }), error => error.unknownOutcome === true);
+    const failures = events.filter(item => item.event === 'rpc.failed');
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].details.method, 'sendrawtransaction');
+    assert.equal(failures[0].details.stage, 'request');
+    assert.equal(failures[0].details.unknownOutcome, true);
+    assert.match(failures[0].details.error.message, /request timed out/);
+    assert.ok(failures[0].details.durationMs >= 20);
+    assert.equal(server.requests.length, 1);
+  } finally { await server.close(); }
+});
+
+test('stream protocol failures are diagnosed at the stream stage', async () => {
+  const events = [];
+  const server = await mock((request, socket) => socket.write([
+    response(request, { stream_id: 'diagnostic-stream' }),
+    note('stream.chunk', { stream_id: 'diagnostic-stream', sequence: 2, items: { type: 'snapshot' } }),
+  ].map(line).join('')), { onDiagnostic: (event, details) => events.push({ event, details }) });
+  try {
+    await assert.rejects(server.client.request('getblockbounties', { block_hash: hash }, { onChunk() {} }), /invalid or oversized/);
+    const failures = events.filter(item => item.event === 'rpc.failed');
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].details.method, 'getblockbounties');
+    assert.equal(failures[0].details.stage, 'stream');
+    assert.equal(failures[0].details.unknownOutcome, false);
+    assert.match(failures[0].details.error.message, /invalid or oversized/);
+  } finally { await server.close(); }
+});
+
+test('connection failures retain their socket code and request context', async () => {
+  const events = [];
+  const server = await mock(() => {}, { onDiagnostic: (event, details) => events.push({ event, details }) });
+  const port = server.client.port;
+  await server.close();
+  const client = new RpcClient({ host: '127.0.0.1', port, timeoutMs: 1000, onDiagnostic: (event, details) => events.push({ event, details }) });
+  try {
+    await assert.rejects(client.request('getchaintip'), /Cannot connect/);
+    const failures = events.filter(item => item.event === 'rpc.failed');
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].details.stage, 'connect');
+    assert.equal(failures[0].details.method, 'getchaintip');
+    assert.equal(failures[0].details.unknownOutcome, false);
+    assert.equal(failures[0].details.error.code, 'ECONNREFUSED');
+  } finally { client.close(); }
+});
+
+test('invalid method names and rejected params are never copied into diagnostics', async () => {
+  const events = [];
+  const client = new RpcClient({ host: '127.0.0.1', port: 48190, onDiagnostic: (event, details) => events.push({ event, details }) });
+  try {
+    await assert.rejects(client.request('secret-caller-input', { password: 'secret-password' }), /not allowed/);
+    await assert.rejects(client.request('getchaintip', { mnemonic: 'secret-phrase' }), /Unexpected/);
+    assert.equal(events.length, 2);
+    assert.equal(events[0].details.method, undefined);
+    assert.equal(events[1].details.method, 'getchaintip');
+    assert.equal(JSON.stringify(events).includes('secret-'), false);
+    assert.equal(client.queuedRequests, 0);
+    assert.equal(client.socket, null);
+  } finally { client.close(); }
+});
+
+test('slow diagnostics include pacing time and omit fast successful requests', async () => {
+  const events = [];
+  const server = await mock((request, socket) => socket.write(line(response(request, true))), {
+    quota: 1, windowMs: 1100, onDiagnostic: (event, details) => events.push({ event, details }),
+  });
+  try {
+    assert.equal(await server.client.request('getchaintip'), true);
+    assert.equal(events.some(item => item.event === 'rpc.slow'), false);
+    assert.equal(await server.client.request('getchaintip'), true);
+    const slow = events.filter(item => item.event === 'rpc.slow');
+    assert.equal(slow.length, 1);
+    assert.equal(slow[0].details.method, 'getchaintip');
+    assert.equal(slow[0].details.stage, 'request');
+    assert.ok(slow[0].details.durationMs >= 1000);
+    assert.equal(events.some(item => item.event === 'rpc.failed'), false);
+    assert.equal(server.requests.length, 2);
+  } finally { await server.close(); }
 });

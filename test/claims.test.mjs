@@ -164,3 +164,54 @@ test('discovery suspension preserves opt-in but prevents queued work until a com
   assert.equal(prepared, 1);
   assert.equal(engine.enabled, false);
 });
+
+test('only explicit recognized submit rejections are classified as diagnostic notices', async () => {
+  const cases = [
+    ...[-22, -25, -26, -8].map(node_code => ({ fields: { code: -32020, data: { node_code } }, recoverable: true })),
+    ...[-27, -99, 0, 999, undefined, null, '-26', NaN, Infinity].map(node_code => ({ fields: { code: -32020, data: { node_code } }, recoverable: false })),
+    { fields: { code: '-32020', data: { node_code: -26 } }, recoverable: false },
+    { fields: { code: -32020, data: { node_code: -26 }, unknownOutcome: true }, recoverable: false },
+    { fields: { code: -32020, data: { node_code: -26 }, unknownOutcome: 'unknown' }, recoverable: false },
+    { fields: { code: -32029 }, recoverable: false },
+    { fields: {}, recoverable: false },
+  ];
+  for (const stage of ['prepare', 'proof', 'submit']) for (const { fields, recoverable } of cases) {
+    const failure = Object.assign(new Error('The node rejected this claim. Its bounty or proof may no longer be valid.'), fields);
+    const engine = new ClaimsEngine({
+      isUnlocked: () => true, retryDelayMs: 300000,
+      prepare: async () => { if (stage === 'prepare') throw failure; return { context: context() }; },
+      generateProof: async () => { if (stage === 'proof') throw failure; return '020100'; },
+      submit: async () => { throw failure; },
+    });
+    assert.equal(engine.snapshot().lastErrorDiagnostic, false);
+    engine.enqueue([bounty()]); engine.start();
+    try {
+      await until(() => !!engine.snapshot().lastError && !engine.running);
+      assert.equal(engine.snapshot().lastErrorDiagnostic, stage === 'submit' && recoverable,
+        `${stage}, node ${String(fields.data?.node_code)}, unknown ${String(fields.unknownOutcome)}`);
+      assert.equal(engine.snapshot().lastError, failure.message);
+    } finally { await engine.stop(); }
+  }
+});
+
+test('diagnostic classification clears with its last error when the next claim begins', async () => {
+  const observed = [];
+  const engine = new ClaimsEngine({
+    isUnlocked: () => true, retryDelayMs: 300000,
+    prepare: async item => ({ context: context(), item }), generateProof: async () => '020100',
+    submit: async prepared => {
+      if (prepared.item.vout === 0) throw Object.assign(new Error('Known node rejection'), { code: -32020, data: { node_code: -26 } });
+      return context().txid;
+    },
+    onState: state => observed.push(state),
+  });
+  engine.enqueue([bounty()]); engine.start();
+  await until(() => engine.snapshot().lastErrorDiagnostic && !engine.running);
+  engine.enqueue([bounty(1)]);
+  await until(() => engine.snapshot().completed === 1 && !engine.running);
+  assert.equal(engine.snapshot().lastError, null);
+  assert.equal(engine.snapshot().lastErrorDiagnostic, false);
+  assert.ok(observed.some(state => state.lastErrorDiagnostic));
+  assert.ok(observed.filter(state => state.lastError === null).every(state => state.lastErrorDiagnostic === false));
+  await engine.stop();
+});

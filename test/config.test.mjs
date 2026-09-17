@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { DEFAULT_CONFIG, GENESIS, readConfig, validateConfig, validateRpcEndpoint, validateTip, writeConfig } from '../src/core/config.mjs';
+import { DEFAULT_CONFIG, GENESIS, readConfig, validateConfig, validateDeveloperMode, validateRpcEndpoint, validateTip, writeConfig } from '../src/core/config.mjs';
 
 test('config defaults use plaintext ConnectCoin4 TCP and strip unrelated/secret fields', () => {
   assert.deepEqual(validateConfig({}), DEFAULT_CONFIG);
@@ -67,6 +67,54 @@ test('appearance defaults to the system, accepts only explicit supported prefere
   } finally {
     assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
     assert.ok(path.basename(directory).startsWith('beauty-theme-config-test-'));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test('Developer Mode defaults off and accepts only boolean values without invoking getters or coercion', async () => {
+  assert.equal(DEFAULT_CONFIG.developerMode, false);
+  assert.equal(validateConfig({}).developerMode, false);
+  const example = JSON.parse(await readFile(new URL('../config.example.json', import.meta.url), 'utf8'));
+  assert.equal(example.developerMode, false);
+  assert.deepEqual(validateConfig(example), DEFAULT_CONFIG);
+  for (const developerMode of [true, false]) {
+    assert.equal(validateDeveloperMode(developerMode), developerMode);
+    assert.equal(validateConfig({ developerMode }).developerMode, developerMode);
+  }
+  const invalid = [undefined, null, '', 'true', 'false', 0, 1, NaN, {}, [], new Boolean(false), 1n, Symbol('developerMode'), () => true];
+  for (const developerMode of invalid) {
+    const error = { message: 'Choose whether Developer Mode should be enabled.' };
+    assert.throws(() => validateDeveloperMode(developerMode), error);
+    assert.throws(() => validateConfig({ developerMode }), error);
+  }
+  let invoked = false;
+  assert.throws(() => validateConfig({ get developerMode() { invoked = true; return true; } }), /plain data objects/);
+  assert.throws(() => validateDeveloperMode({ valueOf() { invoked = true; return true; } }), /Developer Mode/);
+  assert.equal(invoked, false);
+});
+test('legacy configurations default Developer Mode off and persist either preference without changing other settings', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'beauty-developer-mode-config-test-'));
+  try {
+    const legacy = {
+      version: 1, network: 'testnet4', theme: 'dark',
+      rpc: { host: '127.0.0.1', port: 18000 },
+      claims: { maxConnectionsPerSecond: 5, maxConcurrent: 12, lookbackBlocks: 300 },
+      autoLockMinutes: 30, feeRate: 2000,
+    };
+    const file = path.join(directory, 'config.json');
+    const saved = JSON.stringify(legacy);
+    await writeFile(file, saved);
+    const loaded = await readConfig(directory);
+    assert.deepEqual(loaded, { ...legacy, developerMode: false });
+    assert.equal(await readFile(file, 'utf8'), saved);
+    for (const developerMode of [true, false]) {
+      const expected = { ...loaded, developerMode };
+      assert.deepEqual(await writeConfig(directory, expected), expected);
+      assert.deepEqual(await readConfig(directory), expected);
+      assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), expected);
+    }
+  } finally {
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
+    assert.ok(path.basename(directory).startsWith('beauty-developer-mode-config-test-'));
     await rm(directory, { recursive: true, force: true });
   }
 });

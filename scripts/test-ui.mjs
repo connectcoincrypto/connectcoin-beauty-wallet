@@ -17,6 +17,7 @@ const tip = { chain: 'testnet4', height: 0, hash: GENESIS.testnet4, genesis_hash
 const requests = [];
 const sockets = new Set();
 let connectionCount = 0;
+let failNextHistory = false;
 const fixture = net.createServer(socket => {
   connectionCount++;
   sockets.add(socket); socket.on('close', () => sockets.delete(socket)); socket.on('error', () => socket.destroy());
@@ -28,6 +29,11 @@ const fixture = net.createServer(socket => {
       const end = buffer.indexOf('\n');
       const { method, id, params = {} } = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
       requests.push(method);
+      if (method === 'getaddresshistory' && failNextHistory) {
+        failNextHistory = false;
+        socket.write(`${JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32001, message: 'Index not ready. private-remote-diagnostic-canary' } })}\n`);
+        continue;
+      }
       let result;
       if (method === 'getchaintip') result = tip;
       else if (method === 'getaddressbalance') result = { tip, address: params.address, unit: 'connects', confirmed: '0', available_confirmed: '0', pending_delta: '0', immature: '0' };
@@ -79,6 +85,25 @@ async function selectTheme(theme, { ui = false } = {}) {
   assert.equal(nativeSource, theme, `Native appearance must match the saved preference (${theme}).`);
   await waitForScheme(await application.evaluate(({ nativeTheme }) => nativeTheme.shouldUseDarkColors));
   assert.equal(JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).theme, theme);
+}
+
+async function toggleDeveloperMode(enabled) {
+  await page.locator('[data-view="settings"]').first().click();
+  await page.getByRole('switch', { name: 'Developer Mode', exact: true }).click();
+  await page.waitForFunction(async value => (await window.beauty.invoke('getState')).config.developerMode === value && document.querySelector('#developer-mode')?.getAttribute('aria-checked') === String(value) && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', enabled);
+  assert.equal(JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).developerMode, enabled);
+}
+
+let presentationSequence = 0;
+async function showClaimPresentation({ message, diagnostic, enabled, pageError = null }) {
+  // Renderer-only fixtures: no real claims, helper calls or broadcasts. Core
+  // tests separately verify how structured rejection codes set this flag.
+  const snapshot = await page.evaluate(() => window.beauty.invoke('getState'));
+  const status = `presentation-check-${++presentationSequence}`;
+  snapshot.claims = { ...snapshot.claims, lastError: message, lastErrorDiagnostic: diagnostic, enabled, status };
+  snapshot.error = pageError;
+  await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('beauty:state', value), snapshot);
+  await page.waitForFunction(expected => document.querySelector('.status-badge')?.textContent === expected, status);
 }
 
 try {
@@ -223,6 +248,74 @@ try {
   assert.equal(await page.locator('#claims-warning').isVisible(), true);
   assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
 
+  stage = 'persistent diagnostic history';
+  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).config.developerMode, false);
+  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).diagnostics, null);
+  assert.equal(await page.locator('.diagnostics-card').count(), 0);
+  await application.evaluate(({ shell }) => {
+    globalThis.diagnosticOpenedPath = null;
+    shell.openPath = async value => { globalThis.diagnosticOpenedPath = value; return ''; };
+  });
+  assert.equal(await page.evaluate(() => window.beauty.invoke('openDiagnostics').then(() => false, () => true)), true);
+  assert.equal(await application.evaluate(() => globalThis.diagnosticOpenedPath), null);
+  const claimWarning = 'The node rejected this claim. Its bounty or proof may no longer be valid.';
+  const claimNotice = () => page.locator('.form-card .notice.danger').filter({ hasText: claimWarning });
+  await showClaimPresentation({ message: claimWarning, diagnostic: true, enabled: true });
+  assert.equal(await claimNotice().count(), 0, 'recoverable claim rejection is hidden by default');
+  await showClaimPresentation({ message: claimWarning, diagnostic: true, enabled: false });
+  assert.equal(await claimNotice().count(), 0, 'pausing claims must not reveal the same recoverable diagnostic');
+  const unknownBroadcast = 'Claim broadcast was not confirmed. Check the transaction before enabling Automatic Claims again.';
+  await showClaimPresentation({ message: unknownBroadcast, diagnostic: false, enabled: false, pageError: unknownBroadcast });
+  assert.equal(await page.locator('.form-card .notice.danger').filter({ hasText: unknownBroadcast }).isVisible(), true);
+  assert.equal(await page.locator('.page-error').isVisible(), true);
+  await page.evaluate(() => window.beauty.invoke('refresh'));
+  failNextHistory = true;
+  assert.equal(await page.evaluate(async () => {
+    try { await window.beauty.invoke('refresh'); return false; } catch { return true; }
+  }), true);
+  await page.locator('.page-error').waitFor();
+  assert.equal(await page.locator('.diagnostics-card').count(), 0, 'technical history stays hidden, not important page errors');
+  await page.evaluate(() => window.beauty.invoke('refresh'));
+  assert.equal(await page.locator('.page-error').count(), 0);
+  const beforeDeveloper = await page.evaluate(() => window.beauty.invoke('getState'));
+  const beforeDeveloperConnections = connectionCount;
+  await toggleDeveloperMode(true);
+  const afterDeveloper = await page.evaluate(() => window.beauty.invoke('getState'));
+  assert.equal(afterDeveloper.phase, beforeDeveloper.phase);
+  assert.equal(afterDeveloper.securityEpoch, beforeDeveloper.securityEpoch);
+  assert.equal(afterDeveloper.wallet.address, beforeDeveloper.wallet.address);
+  assert.equal(afterDeveloper.claims.enabled, beforeDeveloper.claims.enabled);
+  assert.deepEqual(afterDeveloper.config, { ...beforeDeveloper.config, developerMode: true });
+  assert.equal(connectionCount, beforeDeveloperConnections);
+  assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.2');
+  assert.equal(await page.locator('#auto-lock').inputValue(), '30');
+  await page.locator('#developer-mode').scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(screenshots, 'developer-mode-settings.png') });
+  await page.reload();
+  await page.locator('[data-view="claims"]').first().click();
+  await page.waitForFunction(() => document.querySelector('.diagnostic-list')?.textContent.includes('-32001'));
+  assert.match(await page.locator('.diagnostic-list').textContent(), /-32001/);
+  assert.ok(!(await page.locator('.diagnostic-list').textContent()).includes('private-remote-diagnostic-canary'));
+  await showClaimPresentation({ message: claimWarning, diagnostic: true, enabled: true });
+  assert.equal(await claimNotice().isVisible(), true, 'Developer Mode reveals the inline claim rejection');
+  await page.getByRole('button', { name: 'Open log folder' }).click();
+  assert.equal(await application.evaluate(() => globalThis.diagnosticOpenedPath), path.join(profile, 'logs'));
+  await page.locator('.diagnostics-card').screenshot({ path: path.join(screenshots, 'claims-diagnostics.png') });
+  const diagnosticText = await readFile(path.join(profile, 'logs', 'diagnostics.jsonl'), 'utf8');
+  assert.match(diagnosticText, /rpc.failed/);
+  assert.match(diagnosticText, /wallet.refresh_failed/);
+  for (const secret of [password, seed.join(' '), 'private-remote-diagnostic-canary', address]) {
+    if (secret) assert.ok(!diagnosticText.includes(secret));
+  }
+  await toggleDeveloperMode(false);
+  await page.locator('[data-view="claims"]').first().click();
+  await showClaimPresentation({ message: claimWarning, diagnostic: true, enabled: true });
+  assert.equal(await claimNotice().count(), 0);
+  assert.equal(await page.locator('.diagnostics-card').count(), 0);
+  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).diagnostics, null);
+  await page.screenshot({ path: path.join(screenshots, 'claims-normal-mode.png'), fullPage: true });
+  await page.evaluate(() => window.beauty.invoke('refresh'));
+
   stage = 'lock and unlock';
   await page.getByRole('button', { name: 'Lock wallet', exact: true }).click();
   await page.locator('#unlock-password').waitFor();
@@ -255,7 +348,7 @@ try {
   assert.ok(!requests.includes('sendrawtransaction'));
   assert.deepEqual(errors, []);
   passed = true;
-  console.log(`PASS: real Electron isolation, system/light/dark appearance, restart persistence, draft preservation, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure. Screenshots: ${screenshots}`);
+  console.log(`PASS: real Electron isolation, appearance, Developer Mode visibility and critical alerts, persistence, draft preservation, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure. Screenshots: ${screenshots}`);
 } catch (error) {
   // Avoid Playwright action dumps: they could contain a generated backup word.
   const sourceLine = /test-ui\.mjs:(\d+):\d+/.exec(String(error.stack ?? ''))?.[1];

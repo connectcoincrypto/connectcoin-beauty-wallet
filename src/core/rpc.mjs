@@ -55,31 +55,47 @@ function clearRequest(request) { clearTimeout(request.timer); clearTimeout(reque
 
 /** A bounded, plaintext, native TCP client. No wallet secrets cross this class. */
 export class RpcClient extends EventEmitter {
-  constructor({ host, port, timeoutMs = 40000, quota = 48, windowMs = 60000 } = {}) {
+  constructor({ host, port, timeoutMs = 40000, quota = 48, windowMs = 60000, onDiagnostic = () => {} } = {}) {
     super();
     Object.assign(this, validateRpcEndpoint({ host, port }));
     for (const [name, value, maximum] of [['timeoutMs', timeoutMs, 120000], ['quota', quota, 60], ['windowMs', windowMs, 60000]]) {
       if (!Number.isSafeInteger(value) || value < 1 || value > maximum) throw new Error(`Invalid RPC ${name}.`);
     }
     Object.assign(this, { timeoutMs, quota, windowMs });
+    this.onDiagnostic = onDiagnostic;
+    this.connectionErrors = new WeakMap();
     this.pending = new Map(); this.streams = new Map(); this.history = new Map(); this.cooldowns = new Map();
     this.nextId = 0; this.socket = null; this.connecting = null; this.closed = false; this.queuedRequests = 0;
     this.abort = new AbortController();
+  }
+  diagnostic(event, details) {
+    // Diagnostic sinks must never change transport, quota, or broadcast outcomes.
+    try { Promise.resolve(this.onDiagnostic(event, details)).catch(() => {}); } catch {}
   }
   async connect() {
     if (this.closed) throw new Error('RPC connection is closed.');
     if (this.socket && !this.socket.destroyed && !this.socket.connecting) return this.socket;
     if (this.connecting) return this.connecting;
     const connecting = new Promise((resolve, reject) => {
+      const startedAt = performance.now();
       const socket = net.connect({ host: this.host, port: this.port });
       this.socket = socket;
       let buffer = Buffer.alloc(0), connected = false;
+      let socketFailure = null, idleFailureReported = false;
+      const idleFailure = (error, stage) => {
+        if (idleFailureReported || (!connected && this.queuedRequests > 0)) return;
+        if ([...this.pending.values(), ...this.streams.values()].some(request => request.socket === socket)) return;
+        idleFailureReported = true;
+        this.diagnostic('rpc.failed', { stage, durationMs: performance.now() - startedAt, error, unknownOutcome: false });
+      };
       const connectTimer = setTimeout(() => socket.destroy(new Error('RPC connection timed out.')), Math.min(8000, this.timeoutMs));
       socket.setNoDelay(true); socket.setKeepAlive(true, 10000);
       socket.on('connect', () => {
         clearTimeout(connectTimer);
         if (this.closed || this.socket !== socket) { socket.destroy(); reject(new Error('RPC connection is closed.')); return; }
-        connected = true; this.emit('connected'); resolve(socket);
+        connected = true;
+        this.diagnostic('rpc.connected', { stage: 'connect', durationMs: performance.now() - startedAt });
+        this.emit('connected'); resolve(socket);
       });
       socket.on('data', chunk => {
         if (this.socket !== socket || socket.destroyed) return;
@@ -95,19 +111,29 @@ export class RpcClient extends EventEmitter {
           }
           if (buffer.length > MAX_FRAME) throw new Error('RPC frame exceeds its safety limit.');
         } catch {
-          this.failAll(new Error('RPC server returned an invalid or oversized response.'), socket);
+          const error = new Error('RPC server returned an invalid or oversized response.');
+          idleFailure(error, 'request');
+          this.failAll(error, socket);
           socket.destroy();
         }
       });
       socket.on('error', error => {
-        if (!connected) reject(new Error(`Cannot connect to RPC (${error.code ?? 'network error'}).`));
+        socketFailure = error;
+        idleFailure(error, connected ? 'request' : 'connect');
+        if (!connected) {
+          const failure = new Error(`Cannot connect to RPC (${error.code ?? 'network error'}).`);
+          this.connectionErrors.set(failure, error);
+          reject(failure);
+        }
       });
       socket.on('close', () => {
         clearTimeout(connectTimer);
         if (!connected) reject(new Error('RPC connection closed before connecting.'));
         // An old socket may close after a new connection has already begun.
         // Reject only requests owned by this socket; never kill the new one.
-        this.failAll(new Error('Connection to the RPC server was lost.'), socket);
+        const error = new Error('Connection to the RPC server was lost.');
+        this.failAll(error, socket, socketFailure ?? error);
+        this.diagnostic('rpc.disconnected', { stage: 'connect', durationMs: performance.now() - startedAt });
         if (this.socket === socket) { this.socket = null; this.emit('disconnected'); }
       });
     });
@@ -115,11 +141,13 @@ export class RpcClient extends EventEmitter {
     try { return await connecting; }
     finally { if (this.connecting === connecting) this.connecting = null; }
   }
-  failAll(error, socket = null) {
+  failAll(error, socket = null, diagnosticError = error) {
     for (const [id, request] of this.pending) if (!socket || request.socket === socket) {
+      if (request.diagnostic) request.diagnostic.error ??= diagnosticError;
       clearRequest(request); this.pending.delete(id); request.reject(lossError(request, error));
     }
     for (const [id, stream] of this.streams) if (!socket || stream.socket === socket) {
+      if (stream.diagnostic) stream.diagnostic.error ??= diagnosticError;
       clearRequest(stream); this.streams.delete(id); stream.reject(lossError(stream, error));
     }
   }
@@ -144,6 +172,7 @@ export class RpcClient extends EventEmitter {
       } else if (pending.streaming) {
         const streamId = message.result?.stream_id;
         if (!PLAIN(message.result) || typeof streamId !== 'string' || streamId.length < 1 || streamId.length > 128 || this.streams.has(streamId)) throw new Error('Invalid stream identifier.');
+        if (pending.diagnostic) pending.diagnostic.stage = 'stream';
         const stream = { ...pending, next: 0, records: 0, bytes: 0, phase: 'snapshot' };
         this.pending.delete(message.id); clearRequest(pending);
         this.streams.set(streamId, stream); this.resetStreamTimer(streamId, stream);
@@ -161,7 +190,16 @@ export class RpcClient extends EventEmitter {
       if (!stream || stream.socket !== socket) throw new Error('Unexpected RPC stream.');
       if (message.method === 'stream.end') {
         if (params.complete !== true || params.chunks !== stream.next || stream.phase !== 'end') {
-          this.failAll(new Error('Bounty stream was incomplete; nothing from this block was applied.'), socket);
+          const failure = new Error('Bounty stream was incomplete; nothing from this block was applied.');
+          let diagnosticError = failure;
+          // stream.end puts its server error inside params. Retain only numeric
+          // classifications for diagnostics, never its message or arbitrary data.
+          if (params.complete === false && PLAIN(params.error) && Number.isSafeInteger(params.error.code)) {
+            const data = PLAIN(params.error.data) && Number.isSafeInteger(params.error.data.node_code)
+              ? { node_code: params.error.data.node_code } : undefined;
+            diagnosticError = new RpcError(failure.message, params.error.code, data);
+          }
+          this.failAll(failure, socket, diagnosticError);
           socket.destroy();
         } else {
           this.streams.delete(params.stream_id); clearRequest(stream);
@@ -217,13 +255,19 @@ export class RpcClient extends EventEmitter {
     }
   }
   async request(method, params = {}, { onChunk } = {}) {
-    const clean = validateRpcParams(method, params);
-    if ((method === 'getblockbounties') !== (typeof onChunk === 'function')) throw new Error('Bounty requests require a stream callback; other requests must not use one.');
-    if (this.queuedRequests >= 32) throw new Error('Too many queued RPC requests; retry shortly.');
-    this.queuedRequests++;
+    const startedAt = performance.now(), diagnostic = { stage: 'request', error: null };
+    // Never copy caller params, arbitrary method names, or response bodies into diagnostics.
+    const metadata = typeof method === 'string' && Object.hasOwn(PARAMS, method) ? { method } : {};
+    let queued = false, unknownOutcome = false;
     try {
+      const clean = validateRpcParams(method, params);
+      if ((method === 'getblockbounties') !== (typeof onChunk === 'function')) throw new Error('Bounty requests require a stream callback; other requests must not use one.');
+      if (this.queuedRequests >= 32) throw new Error('Too many queued RPC requests; retry shortly.');
+      this.queuedRequests++; queued = true;
       await this.pace(method, clean);
+      diagnostic.stage = 'connect';
       const socket = await this.connect();
+      diagnostic.stage = 'request';
       if (this.closed || socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
       if (this.pending.size + this.streams.size >= 12) throw new Error('Too many RPC requests; retry shortly.');
       if (this.nextId >= Number.MAX_SAFE_INTEGER) throw new Error('RPC request identifier space exhausted. Reopen the wallet.');
@@ -231,7 +275,7 @@ export class RpcClient extends EventEmitter {
       const encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params: clean }) + '\n';
       if (Buffer.byteLength(encoded) > 900000 || socket.writableLength + Buffer.byteLength(encoded) > 2 * 1024 * 1024) throw new Error('RPC request exceeds the wallet output buffer limit.');
       return await new Promise((resolve, reject) => {
-        const request = { resolve, reject, method, socket, streaming: typeof onChunk === 'function', onChunk, sent: false };
+        const request = { resolve, reject, method, socket, streaming: typeof onChunk === 'function', onChunk, sent: false, diagnostic };
         request.timer = setTimeout(() => { this.failAll(new Error('RPC request timed out.'), socket); socket.destroy(); }, this.timeoutMs);
         this.pending.set(id, request);
         try {
@@ -241,7 +285,15 @@ export class RpcClient extends EventEmitter {
           });
         } catch (error) { this.failAll(error, socket); socket.destroy(); }
       });
-    } finally { this.queuedRequests--; }
+    } catch (error) {
+      unknownOutcome = Boolean(error?.unknownOutcome);
+      this.diagnostic('rpc.failed', { ...metadata, stage: diagnostic.stage, durationMs: performance.now() - startedAt, error: diagnostic.error ?? this.connectionErrors.get(error) ?? error, unknownOutcome });
+      throw error;
+    } finally {
+      if (queued) this.queuedRequests--;
+      const durationMs = performance.now() - startedAt;
+      if (durationMs >= 1000) this.diagnostic('rpc.slow', { ...metadata, stage: diagnostic.stage, durationMs, unknownOutcome });
+    }
   }
   close() {
     this.closed = true; this.abort.abort();

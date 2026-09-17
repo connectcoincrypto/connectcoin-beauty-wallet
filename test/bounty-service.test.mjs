@@ -42,6 +42,58 @@ test('bounty discovery requests complete streams including empty blocks and publ
   assert.equal(f.calls[0].method, 'getbountychanges');
 });
 
+for (const lookback of [600, 7]) test(`discovery reads the oldest of the selected ${lookback} blocks first`, async () => {
+  const f = fixture({ height: 620, rows: new Map() });
+  const result = await f.run({ lookback });
+  const reads = f.calls.filter(call => call.method === 'getblockbounties').map(call => call.block_hash);
+  assert.deepEqual(reads, Array.from({ length: lookback }, (_, index) => hash(622 - lookback + index)));
+  assert.equal(result.blocks.size, lookback);
+  assert.equal(result.tip.height, 620);
+  assert.equal(f.resets, 1);
+});
+
+test('advancing a full recent window during discovery does not discard and reread the scan', async () => {
+  let height = 620, requests = 0, expired = 0;
+  const f = fixture({ rows: new Map(), windows: () => window(height), changes: () => page('c0', [], false, height) });
+  const request = f.rpc.request.bind(f.rpc);
+  f.rpc.request = async (method, params, options) => {
+    if (method === 'getblockbounties') {
+      // Two advances while scanning: newest-first would reach the expired
+      // oldest blocks last and restart; oldest-first has already read them.
+      requests++;
+      if (requests === 100 || requests === 450) height += 4;
+      const blockHeight = Number.parseInt(params.block_hash, 16) - 1;
+      if (blockHeight < height - 599) {
+        expired++;
+        throw Object.assign(new Error('Block left the recent window'), { code: -32004 });
+      }
+    }
+    return request(method, params, options);
+  };
+  const result = await f.run();
+  assert.equal(expired, 0);
+  assert.equal(f.resets, 1, 'only the initial snapshot reset is needed');
+  assert.equal(requests, 608, 'read the initial window once, then only the eight new blocks');
+  const reads = f.calls.filter(call => call.method === 'getblockbounties').map(call => call.block_hash);
+  assert.equal(new Set(reads).size, reads.length, 'completed blocks are not fetched again');
+  assert.equal(result.tip.height, 628);
+  assert.equal(result.blocks.size, 600);
+  assert.deepEqual([...result.blocks.keys()].sort(), window(628).blocks.map(block => block.hash).sort());
+});
+
+test('incremental discovery reads only dirty and missing blocks, oldest first', async () => {
+  let journalCalls = 0;
+  const changes = [2, 7].map((height, index) => ({ sequence: index + 1, type: 'available_again', txid: hash(900 + index), vout: 0, block_hash: hash(height + 1) }));
+  const f = fixture({ height: 10, rows: new Map(), changes: () => page('c2', ++journalCalls === 1 ? changes : [], false, 10) });
+  const previous = new Map(window(9).blocks.map(block => [block.hash, []]));
+  const result = await f.run({ previous, cursor: 'c0' });
+  assert.deepEqual(f.calls.filter(call => call.method === 'getblockbounties').map(call => call.block_hash), [hash(3), hash(8), hash(11)]);
+  assert.equal(result.blocks.size, 11);
+  assert.equal(result.cursor, 'c2');
+  assert.equal(f.resets, 0);
+  assert.equal(previous.size, 10, 'discovery must not mutate the caller cache');
+});
+
 test('spend events without block_hash refresh their original cached block; no resurrection', async () => {
   let requests = 0;
   const f = fixture({ changes() {
@@ -193,6 +245,24 @@ test('an explicit consensus rejection does not masquerade as an unknown broadcas
   await assert.rejects(service.submitAutomaticClaim(prepared, structuralProof(prepared)), /node rejected/i);
   assert.equal(service.engine.enabled, true);
   assert.equal(service.reserved.has(`${bounty.txid}:0`), false);
+});
+
+test('unrecognized or uncertain node rejection replies keep reservations and stop claims', async () => {
+  const errors = [
+    ...[-27, -99, undefined, '-26'].map(node_code => ({ code: -32020, data: { node_code } })),
+    { code: -32020, data: { node_code: -26 }, unknownOutcome: true },
+  ];
+  for (const fields of errors) {
+    const { service, bounty } = serviceFixture();
+    const prepared = await service.prepareAutomaticClaim(bounty);
+    service.rpc.request = async () => { throw Object.assign(new Error('node reply'), fields); };
+    await assert.rejects(service.submitAutomaticClaim(prepared, structuralProof(prepared)), error =>
+      error.unknownOutcome === true && /broadcast was not confirmed/.test(error.message));
+    await Promise.resolve();
+    assert.equal(service.engine.enabled, false);
+    assert.equal(service.reserved.has(`${bounty.txid}:0`), true);
+    assert.match(service.error, /broadcast was not confirmed/);
+  }
 });
 
 test('late responses from an old session cannot stop or unreserve a new session', async () => {

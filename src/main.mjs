@@ -7,7 +7,7 @@ import { WalletService } from './core/wallet-service.mjs';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const INDEX = join(ROOT, 'ui', 'index.html');
 const UI_URL = pathToFileURL(INDEX).href;
-const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','restoreWallet','unlock','lock','previewSend','confirmSend','newAddress','getRecoveryPhrase','saveConfig','setTheme','setClaims','refresh']);
+const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','restoreWallet','unlock','lock','previewSend','confirmSend','newAddress','getRecoveryPhrase','saveConfig','setTheme','setDeveloperMode','setClaims','refresh']);
 const EXTERNAL = new Set(['https://connectcoincrypto.com/','https://connectcoincrypto.com/whitepaper.pdf','https://explorer.connectcoincrypto.com/','https://github.com/connectcoincrypto/connectcoin-beauty-wallet','https://github.com/connectcoincrypto/connectcoin','https://discord.gg/JYWbz5PsPp']);
 let window, service, quitting = false, actionInProgress = false;
 const themeBackground = () => nativeTheme.shouldUseDarkColors ? '#17151e' : '#f7f6f2';
@@ -88,6 +88,13 @@ else {
             service.assertSession(); const address = service.getState().wallet.address;
             if (!address) throw new Error('No receive address is available.');
             clipboard.writeText(address); value = { copied:true };
+          } else if (method === 'openDiagnostics') {
+            service.assertSession();
+            if (!service.config.developerMode) throw new Error('Enable Developer Mode to open diagnostic logs.');
+            // Fixed application-owned directory; never accept a renderer path.
+            const error = await shell.openPath(join(app.getPath('userData'), 'logs'));
+            if (error) throw new Error('Could not open the local diagnostic log folder.');
+            value = { opened: true };
           } else if (method === 'openExternal') {
             const url = new URL(payload.url).href;
             const explorer = new URL(url);

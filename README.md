@@ -83,13 +83,25 @@ Locking drops the decrypted session, invalidates payment reviews and stops claim
 
 ## Automatic Claims architecture
 
-The main process requests recent block hashes and complete bounty streams. Partial streams are rejected; journal updates and reorganizations are reconciled. Metadata is limited to the server's recent window, but address history is chain-wide.
+The main process requests recent block hashes and complete bounty streams, reading the oldest required blocks first to reduce window-expiry retries while the chain advances. Partial streams are rejected; journal updates and reorganizations are reconciled. Metadata is limited to the server's recent window, but address history is chain-wide.
 
 The lookback window selects new work; it does not expire P2C outputs. An attempt already preparing, searching or submitting may finish after its bounty leaves that window. Unstarted candidates leave the discovery queue, and an aged-out attempt is not retried after failure. Known spends, reorganizations, resynchronization and wallet locking still cancel affected work. The wallet uses the validated chain median time from its shared wallet/discovery refresh for proof preparation, without two extra chain-tip requests per claim; the full node validates the submitted proof against its own current consensus state.
 
 For each candidate, funding bytes are verified locally. An immutable spending transaction is prepared before TLS work. The **spending transaction ID**, input index, domain, target, allowed signature schemes, pinned roots and chain median time define the proof context. No private wallet data is passed to the helper. A verified proof is attached without changing the prepared transaction's non-witness data.
 
 The helper uses a hash-pinned consensus root bundle, validates the TLS signature and certificate path, rejects private/local destinations and bounds concurrency/time/output. Claims reserve a conservative fee for the maximum supported proof size; this can cost more than the minimum for a smaller actual proof. The full node remains the final consensus validator. See [helper provenance](helpers/PROVENANCE.md).
+
+## Local diagnostic logs
+
+**Developer Mode** in Settings is off by default, including for existing configurations that do not contain this preference. Enable it to show recoverable claim-rejection warnings and the **Recent diagnostic errors** panel in Automatic Claims. The preference persists without reconnecting RPC or stopping claims. Connection failures, security warnings and errors requiring user action remain visible in normal mode.
+
+The diagnostic panel retains the last 50 errors from the current app session, even when the next bounty clears a transient warning. **Open log folder** opens the application's local diagnostic directory. Local logging remains active with Developer Mode off; the switch controls diagnostic visibility, not collection.
+
+The data folder described above contains `logs/diagnostics.jsonl`, plus up to two rotated files, `diagnostics.1.jsonl` and `diagnostics.2.jsonl`. Each file is limited to 2 MiB (approximately 6 MiB total). Entries include UTC timestamps, an app-session identifier, claim stages and session-local claim numbers, durations, retry counters, and RPC/node error codes when available. File records survive app restarts; the in-app list is for the current session only.
+
+Only allowlisted metadata and canonical error descriptions are recorded. Passwords, recovery words, private keys, addresses, transaction IDs/bytes, TLS proofs, arbitrary backend error text, helper stderr and RPC parameters are **not** written. Unknown errors use a generic description rather than copying potentially sensitive remote text. Logs remain on your device; nothing is uploaded automatically. Review them before sharing, since operation timing and error categories still describe wallet activity.
+
+Writes are asynchronous with a bounded queue and automatic rotation. If the disk or directory is unavailable, claiming continues and the panel reports the logging problem when Developer Mode is enabled; errors remain in bounded memory until the app closes. Diagnostics cannot recover warnings from versions that did not record them.
 
 ## Tests
 

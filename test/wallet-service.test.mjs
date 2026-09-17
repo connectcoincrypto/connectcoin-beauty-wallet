@@ -36,6 +36,36 @@ async function create(service) {
   await service.refresh();
   return setup;
 }
+
+test('transient claim failure remains on disk and in history after a successful next bounty', async t => {
+  const s = await fixture(t);
+  await s.setDeveloperMode({ enabled: true });
+  const setup = await create(s);
+  s.engine.prepare = async item => {
+    if (item.vout === 0) throw Object.assign(new Error('untrusted diagnostic canary ' + PASSWORD), { code: -32020, data: { node_code: -26 } });
+    return { context: { domain: 'example.com', txid: '01'.repeat(32), input_index: 0,
+      connection_work_target: 'ff'.repeat(32), root_certificates_version: 1, signature_algorithms_mask: 7, validation_time: 1800000000 } };
+  };
+  s.engine.generateProof = async () => '020100';
+  s.engine.submit = async prepared => prepared.context.txid;
+  s.engine.enqueue([0, 1].map(vout => ({ txid: '02'.repeat(32), vout, status: 'available' })));
+  s.engine.start();
+  for (let i = 0; i < 100 && s.engine.snapshot().completed !== 1; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(s.engine.snapshot().completed, 1);
+  assert.equal(s.engine.snapshot().lastError, null);
+  assert.equal(s.engine.enabled, true);
+  const recent = s.getState().diagnostics.recent;
+  assert.equal(recent.at(-1).event, 'claim.failed');
+  assert.equal(recent.at(-1).details.error.code, -32020);
+  assert.equal(recent.at(-1).details.error.nodeCode, -26);
+  assert.equal(recent.at(-1).details.stage, 'prepare');
+  await s.diagnostics.flush();
+  const text = await readFile(s.diagnostics.snapshot().file, 'utf8');
+  for (const secret of [setup.mnemonic, PASSWORD, 'untrusted diagnostic canary', s.getState().wallet.address, '02'.repeat(32)]) assert.ok(!text.includes(secret));
+  const rows = text.trim().split('\n').map(JSON.parse);
+  assert.ok(rows.find(row => row.event === 'claim.failed'));
+  assert.ok(rows.find(row => row.event === 'claim.succeeded'));
+});
 test('wallet creation requires backup verification and writes only encrypted data',async t=>{
   const s=await fixture(t);
   const setup=await s.prepareWallet({name:'Test wallet',password:PASSWORD,wordCount:18});
@@ -148,4 +178,58 @@ test('appearance can be saved before onboarding or while locked, without exposin
   await create(s);await s.lock();
   await s.setTheme({theme:'light'});assert.equal(s.getState().phase,'locked');
   assert.equal(s.session,null);assert.equal(s.getState().wallet,null);
+});
+
+test('Developer Mode changes only diagnostic visibility and persists without touching active wallet state', async t => {
+  const s = await fixture(t); await create(s);
+  assert.equal(s.config.developerMode, false);
+  assert.equal(s.getState().diagnostics, null);
+  assert.equal(s.getState().claims.lastErrorDiagnostic, false);
+  s.recordDiagnostic('claim.failed', { stage: 'submit', error: { code: -32020, data: { node_code: -26 } } });
+  const epoch = s.epoch, rpc = s.rpc, engine = s.engine, session = s.session, timer = s.timer;
+  const encrypted = await readFile(s.vaultFile, 'utf8');
+  const preview = s.preview = { previewId: 'preserve-review', epoch };
+  engine.start();
+  engine.notify({ lastError: 'The node rejected this claim.', lastErrorDiagnostic: true });
+  const claims = engine.snapshot(), calls = rpc.calls.length;
+  const { developerMode, ...otherSettings } = s.config;
+  for (const enabled of [true, false, true, false]) {
+    const result = await s.setDeveloperMode({ enabled });
+    assert.equal(result.config.developerMode, enabled);
+    assert.equal(result.diagnostics !== null, enabled);
+    if (enabled) assert.equal(result.diagnostics.recent.at(-1).details.error.code, -32020);
+    // Keep the complete claim error in state; the renderer decides visibility.
+    assert.equal(result.claims.lastError, 'The node rejected this claim.');
+    assert.equal(result.claims.lastErrorDiagnostic, true);
+    assert.equal(s.epoch, epoch); assert.equal(s.rpc, rpc); assert.equal(s.engine, engine);
+    assert.equal(s.session, session); assert.equal(s.timer, timer); assert.equal(s.preview, preview);
+    assert.equal(engine.enabled, true); assert.deepEqual(engine.snapshot(), claims);
+    assert.equal(rpc.calls.length, calls);
+    assert.equal(await readFile(s.vaultFile, 'utf8'), encrypted);
+    const saved = JSON.parse(await readFile(join(s.directory, 'config.json'), 'utf8'));
+    assert.equal(saved.developerMode, enabled);
+    const { developerMode: savedMode, ...savedSettings } = saved;
+    assert.deepEqual(savedSettings, otherSettings);
+  }
+  for (const enabled of [undefined, null, 'true', 'false', 1, 0, {}, []]) await assert.rejects(s.setDeveloperMode({ enabled }), /Developer Mode/);
+  assert.equal(s.config.developerMode, false); assert.equal(s.preview, preview);
+  s.recordDiagnostic('wallet.refresh_failed', { stage: 'refresh', error: new Error('RPC request timed out.') });
+  await s.diagnostics.flush();
+  const disk = await readFile(s.diagnostics.snapshot().file, 'utf8');
+  assert.ok(disk.includes('wallet.refresh_failed'));
+  assert.equal(s.getState().diagnostics, null);
+});
+
+test('Developer Mode never exposes diagnostic history before onboarding or while locked', async t => {
+  const s = await fixture(t);
+  await s.setDeveloperMode({ enabled: true });
+  assert.equal(s.getState().phase, 'welcome');
+  assert.equal(s.getState().diagnostics, null);
+  await create(s);
+  assert.ok(s.getState().diagnostics);
+  await s.lock();
+  assert.equal(s.getState().phase, 'locked');
+  assert.equal(s.getState().diagnostics, null);
+  await s.setDeveloperMode({ enabled: false });
+  assert.equal(s.session, null); assert.equal(s.getState().wallet, null);
 });

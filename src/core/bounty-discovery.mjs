@@ -93,7 +93,10 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       }
     };
     const loadDirty = async () => {
-      const pending = wanted.filter(block => !staged.has(block.hash) || dirty.has(block.hash));
+      // The server lists newest first. Read the oldest required blocks first,
+      // before new blocks can push them out of the recent window. Reverse only
+      // the work queue; keep the validated window and journal order unchanged.
+      const pending = wanted.filter(block => !staged.has(block.hash) || dirty.has(block.hash)).reverse();
       let position = 0, failure;
       const current = () => { check(); if (failure) throw failure; };
       const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {

@@ -4,12 +4,14 @@ import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import QRCode from 'qrcode';
 import { RpcClient } from './rpc.mjs';
-import { readConfig, writeConfig, validateConfig, validateTheme, validateTip } from './config.mjs';
+import { readConfig, writeConfig, validateConfig, validateTheme, validateDeveloperMode, validateTip } from './config.mjs';
 import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic } from './crypto.mjs';
 import { createVault, unlockVault, updateVault, validatePassword } from './vault.mjs';
 import { buildPayment, prepareClaim, attachClaimProof, parseCoinAmount, formatCoinAmount, estimateClaimFee, parseTransaction, transactionId } from './transaction.mjs';
-import { ClaimsEngine, createProofRunner, getClaimsHelper } from './claims.mjs';
+import { ClaimsEngine, createProofRunner, getClaimsHelper, isKnownClaimRejection } from './claims.mjs';
 import { bountyKey, discoverBounties, readBountyBlock } from './bounty-discovery.mjs';
+import { DiagnosticLog } from './diagnostics.mjs';
+import { performance } from 'node:perf_hooks';
 
 const HASH = /^[0-9a-f]{64}$/;
 const MONEY = /^-?\d{1,19}$/;
@@ -30,6 +32,7 @@ export class WalletService extends EventEmitter {
   constructor({ directory, resourcesPath, allowRegtest = false, clientFactory = options => new RpcClient(options), proofRunner } = {}) {
     super(); Object.assign(this, { directory, resourcesPath, allowRegtest, clientFactory, proofRunner });
     this.vaultFile = join(directory, 'wallet.beauty.json');
+    this.diagnostics = null;
     this.session = null; this.epoch = 0; this.setup = null; this.preview = null;
     this.walletExists = false; this.accounts = []; this.accountCache = new Map(); this.utxos = []; this.history = [];
     this.balance = null; this.qrDataUrl = null; this.error = null; this.rpc = null;
@@ -40,6 +43,9 @@ export class WalletService extends EventEmitter {
   async initialize() {
     this.config = await readConfig(this.directory, { allowRegtest: this.allowRegtest });
     this.walletExists = await access(this.vaultFile).then(() => true, () => false);
+    this.diagnostics = new DiagnosticLog({ directory: this.directory });
+    this.recordDiagnostic('wallet.started', { stage: 'lifecycle' });
+    await this.diagnostics.flush();
     this.connectClient(); this.createEngine();
     this.timer = setInterval(() => {
       if (this.setup && Date.now() > this.setup.expires) { this.setup = null; this.emitState(); }
@@ -51,7 +57,7 @@ export class WalletService extends EventEmitter {
   }
   connectClient() {
     this.rpc?.close(); this.refreshing = null;
-    const rpc = this.clientFactory(this.config.rpc); this.rpc = rpc;
+    const rpc = this.clientFactory({ ...this.config.rpc, onDiagnostic: (event, details) => this.recordDiagnostic(event, details) }); this.rpc = rpc;
     this.tip = null;
     this.network = { status: 'offline', chain: this.config.network, height: null };
     rpc.on('disconnected', () => {
@@ -65,7 +71,8 @@ export class WalletService extends EventEmitter {
   createEngine() {
     this.engine = new ClaimsEngine({
       isUnlocked: () => Boolean(this.session),
-      generateProof: this.proofRunner ?? createProofRunner({ resourcesPath: this.resourcesPath }),
+      generateProof: this.proofRunner ?? createProofRunner({ resourcesPath: this.resourcesPath, onDiagnostic: (event, details) => this.recordDiagnostic(event, details) }),
+      onDiagnostic: (event, details) => this.recordDiagnostic(event, details),
       prepare: (bounty, options) => this.prepareAutomaticClaim(bounty, options),
       submit: (prepared, proof, options) => this.submitAutomaticClaim(prepared, proof, options),
       options: { connectionsPerSecond: this.config.claims.maxConnectionsPerSecond, concurrency: this.config.claims.maxConcurrent },
@@ -90,12 +97,17 @@ export class WalletService extends EventEmitter {
       network: { ...this.network, host: this.config.rpc.host, port: this.config.rpc.port },
       config: structuredClone(this.config), history: this.session ? this.history : [],
       claims: { ...this.claimInfo, enabled: Boolean(this.engine?.enabled), available: this.claimInfo.queued ?? 0,
+        lastErrorDiagnostic: this.claimInfo.lastErrorDiagnostic === true,
         sent: this.claimInfo.completed ?? 0, successful: this.claimInfo.completed ?? 0,
         helperAvailable: Boolean(this.proofRunner || getClaimsHelper({ resourcesPath: this.resourcesPath })), scanning: Boolean(this.scanningBounties) },
       busy: Boolean(this.refreshing), error: this.error,
+      diagnostics: this.session && this.config.developerMode ? this.diagnostics?.snapshot() ?? null : null,
     };
   }
   emitState() { if (this.config) this.emit('state', this.getState()); }
+  recordDiagnostic(event, details = {}) {
+    try { this.diagnostics?.record(event, { ...details, height: this.network.height }); } catch { /* Logging never controls the wallet. */ }
+  }
   activity() { this.lastActivity = Date.now(); }
   assertSession(epoch = this.epoch) { if (!this.session || epoch !== this.epoch) throw new Error('Wallet locked or changed; please try again after unlocking.'); }
   async prepareWallet({ name, password, wordCount = 24 } = {}) {
@@ -255,7 +267,9 @@ export class WalletService extends EventEmitter {
     if (!this.session) return this.getState();
     if (this.refreshing) return this.refreshing;
     const epoch = this.epoch;
+    const started = performance.now();
     const operation = this.refreshInternal(epoch).catch(error => {
+      this.recordDiagnostic('wallet.refresh_failed', { stage: 'refresh', error, durationMs: Math.round(performance.now() - started) });
       if (epoch === this.epoch) { this.error = error.message; if (!this.rpc.socket) this.network.status = 'offline'; this.emitState(); }
       throw error;
     }).finally(() => { if (this.refreshing === operation) this.refreshing = null; this.emitState(); });
@@ -374,6 +388,12 @@ export class WalletService extends EventEmitter {
     this.config = await writeConfig(this.directory, { ...this.config, theme }, { allowRegtest: this.allowRegtest });
     this.emitState(); return this.getState();
   }
+  async setDeveloperMode({ enabled } = {}) {
+    validateDeveloperMode(enabled);
+    // Diagnostic visibility is independent of wallet, RPC and claim execution.
+    this.config = await writeConfig(this.directory, { ...this.config, developerMode: enabled }, { allowRegtest: this.allowRegtest });
+    this.emitState(); return this.getState();
+  }
   async setClaims({ enabled, maxConnectionsPerSecond, maxConcurrent, lookbackBlocks } = {}) {
     if (typeof enabled !== 'boolean') throw new Error('Choose whether Automatic Claims should be enabled.');
     this.assertSession();
@@ -418,7 +438,9 @@ export class WalletService extends EventEmitter {
     if (!this.engine.enabled) return;
     if (this.bountySync) return this.bountySync;
     const epoch = this.epoch, rpc = this.rpc, engine = this.engine;
+    const started = performance.now();
     const pending = this.syncBountiesInternal(epoch).catch(error => {
+      this.recordDiagnostic('wallet.discovery_failed', { stage: 'discovery', error, durationMs: Math.round(performance.now() - started) });
       if (epoch === this.epoch && this.rpc === rpc && this.engine === engine && engine.enabled) {
         this.error = error.message;
         // Never continue queued work after a partial/invalid discovery.
@@ -514,9 +536,13 @@ export class WalletService extends EventEmitter {
       if (result?.txid !== signed.txid) throw new Error('RPC returned an unexpected claim transaction ID.');
       return { txid: signed.txid };
     } catch (error) {
-      if (error.code === -32020 && error.data?.node_code !== -27) {
+      if (isKnownClaimRejection(error)) {
         if (this.epoch === prepared.epoch && this.rpc === prepared.rpc) this.reserved.delete(key);
-        throw new Error('The node rejected this claim. Its bounty or proof may no longer be valid.');
+        // Keep numeric rejection codes for local diagnostics without retaining
+        // backend text, transaction bytes or arbitrary response data.
+        throw Object.assign(new Error('The node rejected this claim. Its bounty or proof may no longer be valid.'), {
+          code: error.code, data: { node_code: error.data?.node_code },
+        });
       }
       // A timeout, disconnect, mismatched reply or already-known TX can follow a
       // successful broadcast. Stop instead of producing and retrying another claim.
@@ -528,12 +554,14 @@ export class WalletService extends EventEmitter {
           void engine.stop(); this.emitState();
         }
       });
-      throw new Error(message);
+      throw Object.assign(new Error(message), { code: error.code, data: { node_code: error.data?.node_code }, unknownOutcome: true });
     }
   }
   async close() {
     clearInterval(this.timer); await this.lock(); this.rpc?.close();
     // Finish any already-started atomic encrypted write before Electron exits.
     await this.persisting.catch(() => {});
+    this.recordDiagnostic('wallet.closed', { stage: 'lifecycle' });
+    await this.diagnostics?.flush();
   }
 }
