@@ -9,6 +9,59 @@ const bounty = (vout = 0) => ({ txid: '02'.repeat(32), vout, domain: 'example.co
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 async function until(predicate) { for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise((resolve) => setTimeout(resolve, 2)); } throw new Error('Timed out waiting for claims state'); }
 
+test('removing or retiring absent discovery entries does not flood state notifications', () => {
+  let notifications = 0;
+  const engine = new ClaimsEngine({ isUnlocked: () => true, prepare: async () => {}, submit: async () => {}, onState: () => { notifications++; } });
+  for (let vout = 0; vout < 1000; vout++) {
+    engine.remove(bounty().txid, vout);
+    engine.retire(bounty().txid, vout);
+  }
+  assert.equal(notifications, 0);
+  engine.enqueue([bounty()]);
+  const before = notifications;
+  engine.remove(bounty().txid, 0);
+  assert.equal(notifications, before + 1);
+  assert.equal(engine.queue.size, 0);
+  engine.remove(bounty().txid, 0);
+  assert.equal(notifications, before + 1);
+});
+
+test('idempotent discovery invalidation preserves active cancellation and retirement', () => {
+  let notifications = 0;
+  const engine = new ClaimsEngine({ isUnlocked: () => true, prepare: async () => {}, submit: async () => {}, onState: () => { notifications++; } });
+  engine.enqueue([bounty()]);
+  engine.activeKey = `${bounty().txid}:0`;
+  engine.controller = new AbortController();
+  const before = notifications;
+  engine.retire(bounty().txid, 0);
+  assert.equal(engine.queue.get(engine.activeKey).retired, true);
+  assert.equal(engine.controller.signal.aborted, false);
+  engine.retire(bounty().txid, 0);
+  assert.equal(notifications, before + 1);
+  engine.remove(bounty().txid, 0);
+  assert.equal(engine.controller.signal.aborted, true);
+  assert.equal(notifications, before + 2);
+  engine.remove(bounty().txid, 0);
+  assert.equal(notifications, before + 2);
+  // Abort must still work if another cleanup already removed the active entry.
+  engine.controller = new AbortController();
+  engine.remove(bounty().txid, 0);
+  assert.equal(engine.controller.signal.aborted, true);
+  assert.equal(notifications, before + 3);
+});
+
+test('enqueue without new bounties still wakes the scheduler without redundant queue notifications', () => {
+  let notifications = 0, kicks = 0;
+  const engine = new ClaimsEngine({ isUnlocked: () => true, prepare: async () => {}, submit: async () => {}, onState: () => { notifications++; } });
+  engine.kick = () => { kicks++; };
+  assert.equal(engine.enqueue([bounty()]), 1);
+  assert.equal(notifications, 1);
+  assert.equal(engine.enqueue([bounty()]), 0);
+  assert.equal(engine.enqueue([]), 0);
+  assert.equal(notifications, 1);
+  assert.equal(kicks, 3);
+});
+
 test('claims options are finite and public context cannot smuggle private fields', () => {
   assert.equal(validateClaimOptions().concurrency, 100);
   assert.equal(validateClaimOptions().connectionsPerSecond, 100);

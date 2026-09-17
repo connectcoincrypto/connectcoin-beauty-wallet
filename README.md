@@ -77,7 +77,11 @@ Restoration scans both chains with a **20-unused-address gap**. Restored wallets
 
 The wallet-file password is **not a BIP39 passphrase** and does not change the addresses. This initial UI uses an empty BIP39 passphrase. Passwords must have at least 12 characters. The local encrypted file uses **scrypt (`N=131072, r=8, p=1`) and AES-256-GCM**, with a fresh 32-byte salt and 12-byte nonce. Format/KDF metadata is authenticated and KDF parameters are strictly bounded. Writes are atomic, and newly created files are restricted to the current OS account where supported. Windows also depends on your profile's access-control permissions.
 
-The recovery phrase bypasses the local password: anyone with it controls the keys. Write it offline; do not send it to support. An encrypted-file backup still needs its password. To restore that file, close the application and place your backup at `wallet.beauty.json` in the data folder; preserve any existing wallet elsewhere first. Alternatively, use the phrase on a fresh profile.
+The recovery phrase bypasses the local password: anyone with it controls the keys. Write it offline; do not send it to support. On the locked screen, **Forgot password?** restores from your original 12, 18 or 24 words and sets a new local password. There is no password reset by email or support. The app cannot compare a phrase against a locked, encrypted wallet: another valid phrase opens a different wallet, not the original funds.
+
+**Use another wallet** lets you create or import another wallet without unlocking the current one. Both flows require an explicit acknowledgment. The active file stays untouched until a valid restoration completes or you verify the backup words for a newly generated wallet. Cancelling beforehand keeps the current wallet. On completion, the exact previous encrypted file is preserved under `wallet-backups/` in the data folder before the active `wallet.beauty.json` is replaced. Creating another wallet does not transfer or recover the old funds. A backup in the same data folder does not protect against loss of the device; keep an independent offline backup too.
+
+Every encrypted-file backup, including these preserved copies, still needs its original password. To restore one, close the application and place the backup at `wallet.beauty.json` in the data folder; preserve any existing wallet elsewhere first. Alternatively, restore using the original recovery phrase.
 
 Locking drops the decrypted session, invalidates payment reviews and stops claims. The default inactivity lock is 15 minutes, configurable from 1–60. OS lock/suspend also locks the application. **JavaScript cannot guarantee physical erasure of all string copies from memory**, and no software wallet protects against malware controlling your unlocked computer.
 
@@ -109,10 +113,16 @@ Writes are asynchronous with a bounded queue and automatic rotation. If the disk
 npm run check
 npm test
 npm run test:ui
+npm run test:ui:load
+npm run test:ui:recovery
 npm run setup:claims
 ```
 
 Unit tests cover mnemonic vectors, encryption/tampering, exact amounts, funding verification, Schnorr signing, transaction serialization, TCP transport, configuration, claims cancellation and hostile responses. UI tests use temporary isolated profiles and do not touch your real wallet. Helper tests use a controlled local TLS server, never a third-party website.
+
+The UI load test replays 1,000 progress updates with a 500-entry history and checks responsive navigation, scroll/focus preservation and immediate locking. It uses presentation-only fixtures, without a wallet or RPC connection. Background progress is coalesced before full state publication and rendering; security transitions are not delayed.
+
+The recovery UI test uses a temporary profile and loopback RPC fixture to check password recovery, wallet replacement, cancellation, invalid inputs, backup verification, byte-identical encrypted archives and unlocking after restart. Unit tests also cover concurrent writes, expired authorization, lock/close races and backup failures. These tests never replace a real user wallet or broadcast transactions.
 
 CI runs the unit and helper tests on Linux, Windows and macOS, plus the Electron UI smoke test on Linux under Xvfb. For a headless Linux machine, install the runtime dependencies with `npx playwright install-deps chromium`, then run `xvfb-run --auto-servernum npm run test:ui`. Playwright's Linux Electron test launcher supplies `--no-sandbox` by default: these automated tests exercise the UI, preload restrictions and wallet lifecycle, **not enforcement of the operating-system sandbox**. The normal application requests sandboxing and does not add this test flag; do not add it to normal wallet launches.
 

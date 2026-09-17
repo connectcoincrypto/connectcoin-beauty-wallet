@@ -20,6 +20,8 @@
     "test": "node --test test/*.test.mjs",
     "check": "node scripts/check.mjs",
     "test:ui": "node scripts/test-ui.mjs",
+    "test:ui:load": "node scripts/test-ui-load.mjs",
+    "test:ui:recovery": "node scripts/test-ui-recovery.mjs",
     "test:regtest": "node scripts/crypto-regtest.mjs",
     "setup:claims": "node scripts/setup-claims.mjs",
     "build:claims": "node scripts/setup-claims.mjs --build",

@@ -6,11 +6,12 @@ import QRCode from 'qrcode';
 import { RpcClient } from './rpc.mjs';
 import { readConfig, writeConfig, validateConfig, validateTheme, validateDeveloperMode, validateTip } from './config.mjs';
 import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic } from './crypto.mjs';
-import { createVault, unlockVault, updateVault, validatePassword } from './vault.mjs';
+import { createVault, unlockVault, updateVault, validatePassword, replaceVault, vaultFingerprint } from './vault.mjs';
 import { buildPayment, prepareClaim, attachClaimProof, parseCoinAmount, formatCoinAmount, estimateClaimFee, parseTransaction, transactionId } from './transaction.mjs';
 import { ClaimsEngine, createProofRunner, getClaimsHelper, isKnownClaimRejection } from './claims.mjs';
 import { bountyKey, discoverBounties, readBountyBlock } from './bounty-discovery.mjs';
 import { DiagnosticLog } from './diagnostics.mjs';
+import { StatePublisher } from './state-publisher.mjs';
 import { performance } from 'node:perf_hooks';
 
 const HASH = /^[0-9a-f]{64}$/;
@@ -34,11 +35,14 @@ export class WalletService extends EventEmitter {
     this.vaultFile = join(directory, 'wallet.beauty.json');
     this.diagnostics = null;
     this.session = null; this.epoch = 0; this.setup = null; this.preview = null;
+    this.replacement = null; this.walletWrite = null; this.closed = false;
     this.walletExists = false; this.accounts = []; this.accountCache = new Map(); this.utxos = []; this.history = [];
     this.balance = null; this.qrDataUrl = null; this.error = null; this.rpc = null;
     this.network = { status: 'offline', chain: 'testnet4', height: null };
     this.claimBlocks = new Map(); this.claimCursor = null; this.claimInfo = {}; this.retiredClaim = null; this.tip = null;
     this.reserved = new Set(); this.fundingCache = new Map(); this.lastActivity = Date.now(); this.persisting = Promise.resolve();
+    this.statePublisher = new StatePublisher({ publish: () => this.emit('state', this.getState()) });
+    this.statePriority = null;
   }
   async initialize() {
     this.config = await readConfig(this.directory, { allowRegtest: this.allowRegtest });
@@ -49,6 +53,7 @@ export class WalletService extends EventEmitter {
     this.connectClient(); this.createEngine();
     this.timer = setInterval(() => {
       if (this.setup && Date.now() > this.setup.expires) { this.setup = null; this.emitState(); }
+      if (this.replacement && Date.now() > this.replacement.expires) this.cancelWalletReplacement();
       if (this.session && Date.now() - this.lastActivity >= this.config.autoLockMinutes * 60000) void this.lock();
       else if (this.session) void this.refresh().catch(() => {});
     }, 20000);
@@ -92,6 +97,8 @@ export class WalletService extends EventEmitter {
     return {
       phase: this.session ? 'unlocked' : this.walletExists ? 'locked' : 'welcome',
       setupActive: Boolean(this.setup), securityEpoch: this.epoch,
+      replacementActive: Boolean(!this.session && this.replacement && this.replacement.epoch === this.epoch && this.replacement.expires > Date.now()),
+      replacementMode: !this.session && this.replacement && this.replacement.epoch === this.epoch && this.replacement.expires > Date.now() ? this.replacement.mode : null,
       wallet: this.session ? { name: this.session.data.name, address: current?.address ?? '', path: current?.path,
         qrDataUrl: this.qrDataUrl, balance: this.balance, recovering: Boolean(this.recovering), addressCount: this.accounts.length } : null,
       network: { ...this.network, host: this.config.rpc.host, port: this.config.rpc.port },
@@ -104,46 +111,110 @@ export class WalletService extends EventEmitter {
       diagnostics: this.session && this.config.developerMode ? this.diagnostics?.snapshot() ?? null : null,
     };
   }
-  emitState() { if (this.config) this.emit('state', this.getState()); }
+  emitState() {
+    if (!this.config) return;
+    // Progress bursts must not serialize history/QR/diagnostics once per bounty.
+    // Security transitions and actionable errors bypass the progress throttle.
+    const priority = [this.epoch, Boolean(this.session), this.walletExists, this.config.developerMode,
+      this.network.status, Boolean(this.engine?.enabled), this.error,
+      this.claimInfo.lastErrorDiagnostic === true ? null : this.claimInfo.lastError ?? null];
+    const immediate = !this.statePriority || priority.some((value, index) => value !== this.statePriority[index]);
+    this.statePriority = priority;
+    this.statePublisher.request({ immediate });
+  }
   recordDiagnostic(event, details = {}) {
     try { this.diagnostics?.record(event, { ...details, height: this.network.height }); } catch { /* Logging never controls the wallet. */ }
   }
   activity() { this.lastActivity = Date.now(); }
   assertSession(epoch = this.epoch) { if (!this.session || epoch !== this.epoch) throw new Error('Wallet locked or changed; please try again after unlocking.'); }
-  async prepareWallet({ name, password, wordCount = 24 } = {}) {
-    if (this.walletExists || this.session) throw new Error('A wallet already exists.');
+  assertReplacement(replacementId, mode) {
+    const value = this.replacement;
+    if (this.closed || this.session || !this.walletExists || !value || value.replacementId !== replacementId || value.epoch !== this.epoch || value.expires <= Date.now()) throw new Error('Wallet replacement expired or was cancelled. Start again from the unlock screen.');
+    if (mode && value.mode !== mode) throw new Error('Use recovery words to reset your password, or choose Use another wallet.');
+    return value;
+  }
+  async beginWalletReplacement({ mode } = {}) {
+    if (mode !== 'recover' && mode !== 'switch') throw new Error('Choose recovery or another wallet.');
+    if (this.closed || !this.walletExists || this.session || this.walletWrite) throw new Error('Lock the existing wallet and wait for any wallet operation to finish.');
+    const epoch = ++this.epoch;
+    this.replacement = null; this.setup = null;
+    await this.persisting.catch(() => {});
+    const expectedFingerprint = await vaultFingerprint(this.vaultFile);
+    if (this.closed || this.epoch !== epoch || this.session || this.walletWrite) throw new Error('Wallet replacement was cancelled.');
+    this.replacement = { replacementId: randomUUID(), mode, epoch, expectedFingerprint, expires: Date.now() + 600000 };
+    this.emitState();
+    return { replacementId: this.replacement.replacementId };
+  }
+  cancelWalletReplacement() {
+    this.replacement = null; this.setup = null; this.epoch++;
+    this.emitState(); return this.getState();
+  }
+  async prepareWallet({ name, password, wordCount = 24, replacementId } = {}) {
+    if (this.closed || this.walletWrite || this.session) throw new Error('A wallet operation is already in progress.');
+    if (this.walletExists) this.assertReplacement(replacementId, 'switch');
+    else if (replacementId !== undefined) throw new Error('No wallet is available to replace.');
     validatePassword(password); name = walletName(name);
     const mnemonic = generateMnemonic(wordCount);
     const checkIndexes = new Set(); while (checkIndexes.size < 3) checkIndexes.add(randomInt(wordCount));
-    this.setup = { setupId: randomUUID(), mnemonic, password, name, checkIndexes: [...checkIndexes].sort((a,b) => a-b), expires: Date.now() + 600000 };
+    this.setup = { setupId: randomUUID(), mnemonic, password, name, replacementId, epoch: this.epoch, checkIndexes: [...checkIndexes].sort((a,b) => a-b), expires: Date.now() + 600000 };
     return { setupId: this.setup.setupId, mnemonic, checkIndexes: this.setup.checkIndexes };
   }
   cancelSetup() { this.setup = null; return this.getState(); }
   async confirmWallet({ setupId, answers } = {}) {
     const setup = this.setup;
-    if (!setup || setup.setupId !== setupId || setup.expires < Date.now()) throw new Error('Wallet setup expired. Please create a new recovery phrase.');
+    if (!setup || setup.setupId !== setupId || setup.epoch !== this.epoch || setup.expires < Date.now()) throw new Error('Wallet setup expired. Please create a new recovery phrase.');
     const words = setup.mnemonic.split(' ');
     if (!answers || setup.checkIndexes.some(index => String(answers[index] ?? '').trim().toLowerCase() !== words[index])) throw new Error('The backup words do not match. Check your written recovery phrase.');
-    await this.createWallet(setup, false); this.setup = null;
+    await this.createWallet(setup, false);
+    if (this.setup === setup) this.setup = null;
     return this.getState();
   }
-  async restoreWallet({ name, password, mnemonic } = {}) {
+  async restoreWallet({ name, password, mnemonic, replacementId } = {}) {
     validatePassword(password);
     if (!validateMnemonic(mnemonic)) throw new Error('Enter a valid 12, 18 or 24-word BIP39 recovery phrase.');
-    await this.createWallet({ name: walletName(name), password, mnemonic: normalizeMnemonic(mnemonic) }, true);
+    await this.createWallet({ name: walletName(name), password, mnemonic: normalizeMnemonic(mnemonic), replacementId }, true);
     return this.getState();
   }
-  async createWallet({ name, password, mnemonic }, recover) {
-    if (this.walletExists || this.session) throw new Error('A wallet already exists.');
+  async createWallet(input, recover) {
+    if (this.closed || this.walletWrite || this.session) throw new Error('A wallet operation is already in progress.');
+    const operation = this.createWalletInternal(input, recover);
+    this.walletWrite = operation;
+    try { await operation; }
+    finally { if (this.walletWrite === operation) this.walletWrite = null; }
+  }
+  async createWalletInternal({ name, password, mnemonic, replacementId, setupId }, recover) {
+    const replacement = this.walletExists ? this.assertReplacement(replacementId, recover ? undefined : 'switch') : null;
+    if (!replacement && replacementId !== undefined) throw new Error('No wallet is available to replace.');
     const epoch = this.epoch;
+    const check = () => {
+      if (this.closed || epoch !== this.epoch || this.session) throw new Error('Wallet creation or replacement was cancelled.');
+      if (replacement) this.assertReplacement(replacementId, recover ? undefined : 'switch');
+      if (setupId && (this.setup?.setupId !== setupId || this.setup.expires <= Date.now())) throw new Error('Wallet setup expired or was cancelled.');
+    };
+    check();
     const data = { name, mnemonic, network: this.config.network, passphrase: '', receiveIndex: 0, changeIndex: 0, lastUsedReceive: -1, lastUsedChange: -1, needsRecovery: recover, createdAt: new Date().toISOString() };
-    await createVault(this.vaultFile, data, password); this.walletExists = true;
-    if (this.epoch !== epoch) { this.emitState(); return; }
+    await this.persisting.catch(() => {}); check();
+    try {
+      if (replacement) await replaceVault(this.vaultFile, data, password, { expectedFingerprint: replacement.expectedFingerprint, check });
+      else await createVault(this.vaultFile, data, password, { check });
+    } catch (error) {
+      if (error.walletPublished === true) {
+        this.walletExists = true; this.replacement = null; this.setup = null; this.epoch++;
+        this.error = error.message; this.emitState();
+      }
+      throw error;
+    }
+    this.walletExists = true;
+    if (this.closed || this.epoch !== epoch) { this.emitState(); return; }
+    this.replacement = null;
     await this.openSession(data, password);
   }
   async unlock({ password } = {}) {
-    if (!this.walletExists || this.session) throw new Error('Wallet is not locked.');
+    if (this.closed || !this.walletExists || this.session) throw new Error('Wallet is not locked.');
+    this.replacement = null; this.setup = null; this.epoch++;
     const epoch = this.epoch;
+    await this.walletWrite?.catch(() => {});
+    if (this.closed || this.epoch !== epoch) throw new Error('Unlock was cancelled.');
     const data = await unlockVault(this.vaultFile, password);
     if (this.epoch !== epoch) throw new Error('Unlock was cancelled.');
     await this.openSession(data, password); return this.getState();
@@ -152,6 +223,7 @@ export class WalletService extends EventEmitter {
     if (data.network !== this.config.network) throw new Error('Wallet and RPC configuration belong to different networks.');
     for (const key of ['receiveIndex', 'changeIndex']) if (!Number.isSafeInteger(data[key]) || data[key] < 0 || data[key] > 999) throw new Error('Unsupported wallet address index.');
     walletName(data.name);
+    this.replacement = null; this.setup = null;
     this.session = { data, password }; this.epoch++; this.activity(); this.error = null;
     this.buildAccounts(); await this.makeQR(); this.emitState();
     void this.refresh().catch(() => {});
@@ -186,7 +258,7 @@ export class WalletService extends EventEmitter {
     this.persisting = operation; await operation;
   }
   async lock() {
-    this.epoch++; this.preview = null; this.setup = null;
+    this.epoch++; this.preview = null; this.setup = null; this.replacement = null;
     const epoch = this.epoch;
     this.session = null; this.accounts = []; this.utxos = []; this.history = []; this.balance = null; this.qrDataUrl = null;
     this.tip = null; this.retiredClaim = null;
@@ -374,7 +446,7 @@ export class WalletService extends EventEmitter {
   }
   async saveConfig(input = {}) {
     const config = validateConfig({ ...this.config, ...input, network: this.config.network, rpc: { ...this.config.rpc, ...input.rpc }, claims: { ...this.config.claims, ...input.claims } }, { allowRegtest: this.allowRegtest });
-    this.epoch++; this.rpc?.close(); this.refreshing = null;
+    this.epoch++; this.replacement = null; this.setup = null; this.rpc?.close(); this.refreshing = null;
     await this.engine.stop(); this.engine.clear(); this.preview = null;
     this.config = await writeConfig(this.directory, config, { allowRegtest: this.allowRegtest });
     this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null; this.connectClient();
@@ -558,9 +630,15 @@ export class WalletService extends EventEmitter {
     }
   }
   async close() {
-    clearInterval(this.timer); await this.lock(); this.rpc?.close();
+    this.closed = true;
+    clearInterval(this.timer);
+    // lock() publishes cleared sensitive state synchronously before its first await.
+    const locking = this.lock();
+    this.statePublisher.close();
+    await locking; this.rpc?.close();
     // Finish any already-started atomic encrypted write before Electron exits.
     await this.persisting.catch(() => {});
+    await this.walletWrite?.catch(() => {});
     this.recordDiagnostic('wallet.closed', { stage: 'lifecycle' });
     await this.diagnostics?.flush();
   }

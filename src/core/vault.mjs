@@ -1,5 +1,6 @@
 // Password encryption is separate from the optional BIP39 seed passphrase.
-import { createCipheriv, createDecipheriv, randomBytes, scrypt } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt } from 'node:crypto';
+import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { chmod, link, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import path from 'node:path';
@@ -81,7 +82,7 @@ async function safeFile(file, mustExist = false) {
     throw error;
   }
 }
-async function persist(file, envelope, replace) {
+async function persist(file, envelope, replace, check = () => {}) {
   const destination = path.resolve(file);
   const directory = path.dirname(destination);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -98,6 +99,7 @@ async function persist(file, envelope, replace) {
     await handle.sync();
     await handle.close();
     handle = undefined;
+    check();
     // link() is atomic and refuses to replace an existing destination on create.
     if (replace) await rename(temporary, destination);
     else { await link(temporary, destination); await unlink(temporary); }
@@ -111,8 +113,75 @@ async function persist(file, envelope, replace) {
     await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
 }
-export async function createVault(file, payload, password) {
-  await persist(file, await encryptVault(payload, password), false);
+export async function createVault(file, payload, password, { check = () => {} } = {}) {
+  await persist(file, await encryptVault(payload, password), false, check);
+}
+function fingerprint(bytes) { return createHash('sha256').update(bytes).digest('hex'); }
+export async function vaultFingerprint(file) {
+  await safeFile(file, true);
+  const bytes = await readFile(file);
+  if (bytes.length > LIMIT + 4096) throw new Error('Wallet file is too large');
+  return fingerprint(bytes);
+}
+// Replacement is deliberately independent of the forgotten password. Preserve
+// the EXACT old ciphertext before publishing a fully encrypted new wallet.
+export async function replaceVault(file, payload, password, { expectedFingerprint, check = () => {} } = {}) {
+  if (typeof expectedFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(expectedFingerprint)) throw new Error('Wallet replacement authorization is invalid.');
+  const envelope = await encryptVault(payload, password);
+  check();
+  const destination = path.resolve(file), directory = path.dirname(destination);
+  const directoryInfo = await lstat(directory);
+  if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) throw new Error('Wallet directory must not be a symbolic link');
+  await safeFile(destination, true);
+  const original = await readFile(destination);
+  if (original.length > LIMIT + 4096 || fingerprint(original) !== expectedFingerprint) throw new Error('The wallet file changed. Start recovery or replacement again.');
+  const backups = path.join(directory, 'wallet-backups');
+  await mkdir(backups, { recursive: true, mode: 0o700 });
+  const backupInfo = await lstat(backups);
+  if (!backupInfo.isDirectory() || backupInfo.isSymbolicLink()) throw new Error('Wallet backup directory must not be a symbolic link');
+  check();
+  const suffix = randomBytes(16).toString('hex');
+  const backupFile = path.join(backups, `wallet-${new Date().toISOString().replace(/[:.]/g, '-')}-${suffix}.beauty.json`);
+  const temporary = path.join(directory, `.wallet-${suffix}.tmp`);
+  let temporaryHandle, backupHandle, backupComplete = false, backupCreated = false;
+  try {
+    temporaryHandle = await open(temporary, 'wx', 0o600);
+    await temporaryHandle.writeFile(`${JSON.stringify(envelope)}\n`, 'utf8');
+    await temporaryHandle.sync(); await temporaryHandle.close(); temporaryHandle = undefined;
+    check();
+    backupHandle = await open(backupFile, 'wx', 0o600); backupCreated = true;
+    await backupHandle.writeFile(original); await backupHandle.sync();
+    await backupHandle.close(); backupHandle = undefined;
+    // Persist the backup directory entry before the active file can be replaced.
+    if (process.platform !== 'win32') {
+      const handle = await open(backups, 'r');
+      try { await handle.sync(); } finally { await handle.close(); }
+      const parent = await open(directory, 'r');
+      try { await parent.sync(); } finally { await parent.close(); }
+    }
+    backupComplete = true;
+    // These bounded metadata operations share one JS turn with the final check:
+    // a cancel/lock cannot run between authorization and atomic publication.
+    const current = lstatSync(destination);
+    if (!current.isFile() || current.isSymbolicLink() || current.size > LIMIT + 4096 || fingerprint(readFileSync(destination)) !== expectedFingerprint) throw new Error('The wallet file changed. Start recovery or replacement again.');
+    check();
+    renameSync(temporary, destination);
+    if (process.platform !== 'win32') {
+      let handle;
+      try { handle = openSync(directory, 'r'); fsyncSync(handle); closeSync(handle); handle = undefined; }
+      catch {
+        // Publication has already happened: never report this as an aborted
+        // replacement or allow the old authorization to be retried blindly.
+        throw Object.assign(new Error('The new wallet was installed, but storage could not confirm a durable save. Keep both recovery phrases safe and verify access with the new password. The previous encrypted backup is preserved.'), { walletPublished: true });
+      } finally { if (handle !== undefined) { try { closeSync(handle); } catch { /* The publication error above takes priority. */ } } }
+    }
+    return { backupFile };
+  } finally {
+    await temporaryHandle?.close().catch(() => {});
+    await backupHandle?.close().catch(() => {});
+    await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    if (backupCreated && !backupComplete) await unlink(backupFile).catch(() => {});
+  }
 }
 export async function unlockVault(file, password) {
   await safeFile(file, true);

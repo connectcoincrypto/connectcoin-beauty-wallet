@@ -30,3 +30,11 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 5
         run: xvfb-run --auto-servernum npm run test:ui
+      - name: Test Electron responsiveness under claim progress bursts
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: xvfb-run --auto-servernum npm run test:ui:load
+      - name: Test locked wallet recovery and replacement
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: xvfb-run --auto-servernum npm run test:ui:recovery

@@ -207,18 +207,20 @@ export class ClaimsEngine {
       this.queue.set(key, { bounty: structuredClone(bounty), due: 0, failures: 0, diagnosticId: ++this.nextDiagnosticId });
       count++;
     }
-    this.notify();
+    if (count) this.notify();
     this.kick();
     return count;
   }
   remove(txid, vout) {
     const key = `${txid}:${vout}`;
-    this.queue.delete(key);
-    if (this.activeKey === key) this.controller?.abort();
-    this.notify();
+    const removed = this.queue.delete(key);
+    const abortActive = this.activeKey === key && this.controller && !this.controller.signal.aborted;
+    if (abortActive) this.controller.abort();
+    if (removed || abortActive) this.notify();
   }
   retire(txid, vout) {
     const key = `${txid}:${vout}`, job = this.queue.get(key);
+    if (!job || job.retired) return;
     // Leaving discovery is not consensus expiry. Let the current attempt finish,
     // but do not start or retry work we can no longer monitor in that window.
     if (job && this.activeKey === key) job.retired = true;

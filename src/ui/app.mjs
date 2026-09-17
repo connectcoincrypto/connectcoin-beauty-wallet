@@ -41,6 +41,7 @@ let view = 'overview';
 let sendMode = 'address';
 let authView = 'welcome';
 let setup = null;
+let replacement = null;
 let busy = false;
 const emptySend = () => ({ address: '', domain: '', amount: '', expectedConnections: '1000', feeRate: '1500' });
 let draft = { send: emptySend(), claims: {}, settings: {} };
@@ -49,6 +50,22 @@ let toastTimer, secretTimer;
 let currentPreview;
 let modalKind;
 let unsubscribe;
+let renderTimer = null;
+let pointerActive = false;
+let actionKeyActive = false;
+let compositionActive = false;
+let lastShellMarkup = null;
+
+function scheduleRender() {
+  if (renderTimer !== null) return;
+  renderTimer = setTimeout(() => {
+    renderTimer = null;
+    // Do not replace a pressed button before its click/keyboard activation.
+    // Keep only the latest state; no queue of obsolete DOM updates.
+    if (pointerActive || actionKeyActive || compositionActive) { scheduleRender(); return; }
+    render();
+  }, 200);
+}
 
 function toast(message) {
   clearTimeout(toastTimer);
@@ -84,12 +101,17 @@ function themePreference(config = state.config) {
 function applyTheme() {
   document.documentElement.dataset.theme = themePreference();
 }
-function acceptState(next) {
+function acceptState(next, { background = false } = {}) {
   if (!next || typeof next !== 'object' || !['welcome', 'locked', 'unlocked'].includes(next.phase)) return;
   const previous = state.phase;
+  const importantChange = next.error !== state.error ||
+    (state.claims?.enabled && !next.claims?.enabled) ||
+    (next.claims?.lastError && !next.claims.lastErrorDiagnostic && next.claims.lastError !== state.claims?.lastError);
   const securityChanged = state.securityEpoch !== undefined && next.securityEpoch !== state.securityEpoch;
-  const clearSetup = Boolean(setup && next.setupActive === false) || securityChanged;
+  const replacementEnded = Boolean(replacement && (next.replacementActive !== true || next.phase !== 'locked' || securityChanged));
+  const clearSetup = Boolean(setup && next.setupActive === false) || securityChanged || replacementEnded;
   if (clearSetup) {
+    if (replacementEnded || securityChanged) replacement = null;
     setup = null; authView = 'welcome'; draft.send = emptySend(); closeModal();
     document.querySelectorAll('input[name="password"], input[name="passwordConfirm"], textarea[name="mnemonic"]').forEach(field => { field.value = ''; });
   }
@@ -99,7 +121,8 @@ function acceptState(next) {
   if (next.phase === 'locked' && previous !== 'locked') { setup = null; draft.send = emptySend(); closeModal(); }
   if (next.phase === 'unlocked' && previous !== 'unlocked') { setup = null; authView = 'welcome'; closeModal(); }
   if (!clearSetup && previous === next.phase && next.phase !== 'unlocked' && app.children.length && !$('.boot')) return;
-  render();
+  if (background && previous === next.phase && !securityChanged && !clearSetup && !importantChange) scheduleRender();
+  else render();
 }
 const errorSlot = () => '<div id="view-error" class="inline-error hidden" role="alert"></div>';
 const title = { overview: 'Overview', send: 'Send', receive: 'Receive', claims: 'Automatic claims', activity: 'Activity', settings: 'Settings' };
@@ -108,23 +131,37 @@ function pageHeading(heading, description, action = '') {
 }
 function online() { return ['connected', 'ready', 'online', 'synced'].includes(state.network?.status); }
 function render() {
+  clearTimeout(renderTimer); renderTimer = null;
+  const scrollX = window.scrollX, scrollY = window.scrollY;
+  const diagnosticScroll = $('.diagnostic-list')?.scrollTop;
   const focused = document.activeElement;
   const focusId = focused?.id;
   const start = focused?.selectionStart;
   const end = focused?.selectionEnd;
   if (state.phase === 'unlocked') renderShell();
-  else if (setup && ['backup', 'verify'].includes(authView)) renderBackup();
-  else renderAuth();
+  else {
+    lastShellMarkup = null;
+    if (setup && ['backup', 'verify'].includes(authView)) renderBackup();
+    else renderAuth();
+  }
   if (focusId) {
     const replacement = document.getElementById(focusId);
     if (replacement) { replacement.focus({ preventScroll: true }); if (typeof replacement.setSelectionRange === 'function' && start != null) { try { replacement.setSelectionRange(start, end); } catch { /* number/select input */ } } }
   }
   setBusy(busy);
+  window.scrollTo(scrollX, scrollY);
+  if (diagnosticScroll != null && $('.diagnostic-list')) $('.diagnostic-list').scrollTop = diagnosticScroll;
+}
+function updateShell(markup) {
+  // Unrelated claim progress must not rebuild Activity, Settings or a form.
+  if (markup === lastShellMarkup) return;
+  app.innerHTML = markup;
+  lastShellMarkup = markup;
 }
 function renderShell() {
   const wallet = state.wallet ?? {};
   const network = state.network ?? {};
-  app.innerHTML = `<div class="shell"><aside class="sidebar">${brand()}<div class="nav-label">YOUR WALLET</div><nav class="nav" aria-label="Main navigation">${Object.entries(title).map(([name, label]) => `<button class="nav-button ${view === name ? 'active' : ''}" data-view="${name}" title="${label}" ${view === name ? 'aria-current="page"' : ''}>${icon({overview:'grid',send:'send',receive:'receive',claims:'globe',activity:'activity',settings:'settings'}[name])}<span>${label}</span></button>`).join('')}</nav><div class="sidebar-bottom"><div class="testnet-note"><div class="label"><span class="dot online"></span> A space to experiment</div><p>You’re on ConnectCoin testnet. These coins have no promised monetary value.</p></div><div class="sidebar-foot"><span>Made for connection.</span><button class="icon-button" data-action="lock" title="Lock wallet" aria-label="Lock wallet">${icon('lock')}</button></div></div></aside><main class="workspace"><header class="topbar"><div class="breadcrumb"><span>Your workspace</span><span class="separator">/</span><strong>${title[view]}</strong></div><div class="top-actions"><div class="network-pill"><span class="dot ${online() ? 'online' : ''}"></span>${e(network.chain ?? 'testnet4')} · ${online() ? 'Connected' : e(network.status ?? 'Connecting')}</div><button class="icon-button" data-action="refresh" title="Refresh wallet" aria-label="Refresh wallet">${icon('refresh')}</button><div class="profile" title="${e(wallet.name ?? 'My wallet')}">${e((wallet.name ?? 'My wallet').slice(0, 2).toUpperCase())}</div></div></header>${state.error ? `<div class="page-error">${notice(e(typeof state.error === 'string' ? state.error : state.error.message), 'danger')}</div>` : ''}${errorSlot()}<div id="page">${({ overview: overview, send: sendPage, receive: receivePage, claims: claimsPage, activity: activityPage, settings: settingsPage })[view]()}</div><footer class="bottom-strip"><span>${icon('shield')} Your keys stay on this device.</span><span>${icon('connection')}${network.height != null ? `Block ${e(Number(network.height).toLocaleString('en-US'))}` : 'Waiting for network'}<span aria-hidden="true">·</span> ${e(network.host ?? state.config?.rpc?.host ?? '')}</span></footer></main></div>`;
+  updateShell(`<div class="shell"><aside class="sidebar">${brand()}<div class="nav-label">YOUR WALLET</div><nav class="nav" aria-label="Main navigation">${Object.entries(title).map(([name, label]) => `<button class="nav-button ${view === name ? 'active' : ''}" data-view="${name}" title="${label}" ${view === name ? 'aria-current="page"' : ''}>${icon({overview:'grid',send:'send',receive:'receive',claims:'globe',activity:'activity',settings:'settings'}[name])}<span>${label}</span></button>`).join('')}</nav><div class="sidebar-bottom"><div class="testnet-note"><div class="label"><span class="dot online"></span> A space to experiment</div><p>You’re on ConnectCoin testnet. These coins have no promised monetary value.</p></div><div class="sidebar-foot"><span>Made for connection.</span><button class="icon-button" data-action="lock" title="Lock wallet" aria-label="Lock wallet">${icon('lock')}</button></div></div></aside><main class="workspace"><header class="topbar"><div class="breadcrumb"><span>Your workspace</span><span class="separator">/</span><strong>${title[view]}</strong></div><div class="top-actions"><div class="network-pill"><span class="dot ${online() ? 'online' : ''}"></span>${e(network.chain ?? 'testnet4')} · ${online() ? 'Connected' : e(network.status ?? 'Connecting')}</div><button class="icon-button" data-action="refresh" title="Refresh wallet" aria-label="Refresh wallet">${icon('refresh')}</button><div class="profile" title="${e(wallet.name ?? 'My wallet')}">${e((wallet.name ?? 'My wallet').slice(0, 2).toUpperCase())}</div></div></header>${state.error ? `<div class="page-error">${notice(e(typeof state.error === 'string' ? state.error : state.error.message), 'danger')}</div>` : ''}${errorSlot()}<div id="page">${({ overview: overview, send: sendPage, receive: receivePage, claims: claimsPage, activity: activityPage, settings: settingsPage })[view]()}</div><footer class="bottom-strip"><span>${icon('shield')} Your keys stay on this device.</span><span>${icon('connection')}${network.height != null ? `Block ${e(Number(network.height).toLocaleString('en-US'))}` : 'Waiting for network'}<span aria-hidden="true">·</span> ${e(network.host ?? state.config?.rpc?.host ?? '')}</span></footer></main></div>`);
 }
 function overview() {
   const balance = state.wallet?.balance ?? {};
@@ -180,15 +217,18 @@ function settingsPage() {
   return `${pageHeading('Make yourself at home.', 'Your connection, your security, your preferences.')}<div class="settings-stack"><section class="card form-card appearance-row"><div><h2>Appearance</h2><p class="card-description" id="theme-description">Make this space feel like yours. System follows your device’s light or dark appearance automatically.</p></div><label class="field appearance-field"><span class="field-label">Color theme</span><select class="select" id="theme-preference" aria-describedby="theme-description" data-busy>${[['system','System (default)'],['light','Light'],['dark','Dark']].map(([value,label]) => `<option value="${value}" ${themePreference() === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label></section><section class="card form-card"><h2>Network connection</h2><p class="card-description">Connect to a restricted ConnectCoin JSON-RPC server. This wallet does not run a full node.</p><form id="settings-form"><div class="two-fields"><label class="field"><span class="field-label">Server hostname or IP</span><input class="input" id="rpc-host" name="host" data-draft="settings.host" value="${e(rpc.host)}" spellcheck="false" autocomplete="off" required></label><label class="field"><span class="field-label">TCP port</span><input class="input" id="rpc-port" name="port" data-draft="settings.port" type="number" min="1" max="65535" value="${e(rpc.port)}" required></label></div><label class="field"><span class="field-label">Lock after inactivity <small>Minutes · 1–60</small></span><input class="input" id="auto-lock" name="autoLockMinutes" data-draft="settings.autoLockMinutes" type="number" min="1" max="60" step="1" value="${e(autoLockMinutes)}" required></label>${notice('<strong>This connection is not encrypted.</strong> Queried addresses and transactions can be observed or altered in transit. The server supplies balances, transaction history and bounty data; this is not independent full-node verification. Use a server you trust.')}<div class="form-actions"><button class="button" type="submit" data-busy>Save & reconnect ${icon('connection')}</button></div></form></section><section class="card form-card"><h2>Security & backup</h2><p class="card-description">Your recovery phrase controls your coins. Keep an offline copy somewhere safe.</p><div class="setting-row"><div><strong>Recovery phrase</strong><p>View your words privately. Your wallet password is required.</p></div><button class="button secondary" data-action="recovery">${icon('key')} View recovery phrase</button></div><div class="setting-row"><div><strong>Encrypted wallet backup</strong><p>Save an encrypted copy of this wallet. Keep the password separately.</p></div><button class="button secondary" data-action="export" data-busy>${icon('file')} Export wallet</button></div><div class="setting-row"><div><strong>Lock your wallet</strong><p>Automatic claims pause while locked. Wallet locks after ${e(state.config?.autoLockMinutes ?? 15)} minutes of inactivity.</p></div><button class="button secondary" data-action="lock" data-busy>${icon('lock')} Lock now</button></div></section>${developerSettings()}<section class="card"><h3>Beauty Wallet, by ConnectCoin.</h3><p class="card-description">A lighter way to participate. Built for ConnectCoin testnet.</p><div class="footer-links"><button data-action="external" data-url="https://connectcoincrypto.com/">ConnectCoin ↗</button><button data-action="external" data-url="https://discord.gg/JYWbz5PsPp">Community ↗</button><button data-action="external" data-url="https://explorer.connectcoincrypto.com/">Block explorer ↗</button></div></section></div>`;
 }
 function passwordField(id, label, confirm = false) {
-  return `<label class="field"><span class="field-label">${label}</span><div class="password-row"><input class="input" id="${id}" name="${confirm ? 'passwordConfirm' : 'password'}" type="password" autocomplete="${state.phase === 'locked' ? 'current-password' : 'new-password'}" required ${state.phase !== 'locked' ? 'minlength="12"' : ''}><button class="icon-button" type="button" data-action="show-password" data-target="${id}" aria-label="Show password">${icon('eye')}</button></div></label>`;
+  const existing = id === 'unlock-password' || id === 'recovery-password';
+  return `<label class="field"><span class="field-label">${label}</span><div class="password-row"><input class="input" id="${id}" name="${confirm ? 'passwordConfirm' : 'password'}" type="password" autocomplete="${existing ? 'current-password' : 'new-password'}" required ${existing ? '' : 'minlength="12"'}><button class="icon-button" type="button" data-action="show-password" data-target="${id}" aria-label="Show password">${icon('eye')}</button></div></label>`;
 }
 function renderAuth() {
   let content;
-  if (state.phase === 'locked') content = `<div class="lock-icon">${icon('lock')}</div><div class="eyebrow">WELCOME BACK</div><h2>Your wallet. Your space.</h2><p class="card-description">Unlock ${e(state.wallet?.name ?? 'your wallet')} to pick up where you left off.</p>${errorSlot()}<form class="auth-form" id="unlock-form">${passwordField('unlock-password','Wallet password')}<button class="button full" type="submit" data-busy>Unlock wallet ${icon('arrow')}</button></form><p class="field-help">Your password unlocks this device’s encrypted wallet. It is not your recovery phrase.</p>`;
+  if (state.phase === 'locked' && !replacement) content = `<div class="lock-icon">${icon('lock')}</div><div class="eyebrow">WELCOME BACK</div><h2>Your wallet. Your space.</h2><p class="card-description">Unlock ${e(state.wallet?.name ?? 'your wallet')} to pick up where you left off.</p>${errorSlot()}<form class="auth-form" id="unlock-form">${passwordField('unlock-password','Wallet password')}<button class="button full" type="submit" data-busy>Unlock wallet ${icon('arrow')}</button></form><p class="field-help">Your password unlocks this device’s encrypted wallet. It is not your recovery phrase.</p><div class="auth-actions recovery-actions"><button class="button secondary full" type="button" data-action="forgot-password">Forgot password?</button><button class="text-button" type="button" data-action="replace-wallet">Use another wallet</button></div>`;
   else if (authView === 'create' || authView === 'restore') {
     const restore = authView === 'restore';
-    content = `<button class="back-button" data-action="auth-back">${icon('back')} Back</button><div class="eyebrow">${restore ? 'A FAMILIAR PLACE' : 'LET’S GET YOU STARTED'}</div><h2>${restore ? 'Welcome home.' : 'A wallet of your own.'}</h2><p class="card-description">${restore ? 'Restore with your 12, 18 or 24 recovery words. Your new password protects this device only.' : 'Give your wallet a name and protect it with a password. Next, we’ll back up your recovery words.'}</p>${errorSlot()}<form class="auth-form" id="${restore ? 'restore' : 'create'}-form"><label class="field"><span class="field-label">Wallet name</span><input class="input" name="name" id="setup-name" placeholder="My ConnectCoin wallet" maxlength="40" required></label>${restore ? '<label class="field"><span class="field-label">Recovery phrase</span><textarea class="textarea" id="restore-phrase" name="mnemonic" spellcheck="false" autocomplete="off" autocapitalize="none" placeholder="Enter your words in order, separated by spaces" required></textarea></label>' : '<div class="field-label">Recovery phrase length</div><div class="choice-row">'+[12,18,24].map(count => `<label class="choice"><input type="radio" name="wordCount" value="${count}" ${count === 24 ? 'checked' : ''}><span>${count} words</span></label>`).join('')+'</div>'}${passwordField('setup-password','Create a password')}${passwordField('setup-confirm','Confirm password',true)}<p class="field-help">Use at least 12 characters. This is an encryption password, not an additional BIP39 passphrase.</p><div class="form-actions"><button class="button full" data-busy type="submit">${restore ? 'Restore wallet' : 'Create recovery phrase'} ${icon('arrow')}</button></div></form>`;
-  } else content = `<div class="eyebrow">CONNECTCOIN, A LITTLE CLOSER.</div><h2>Hello, connection.</h2><p class="card-description">A calm home for your ConnectCoin. Send, receive and explore Pay-to-Connect — without a full node.</p>${errorSlot()}<div class="auth-actions"><button class="button full" data-action="auth-create">Create a new wallet ${icon('arrow')}</button><button class="button secondary full" data-action="auth-restore">I already have a recovery phrase</button></div>${notice('<strong>Welcome to testnet.</strong> This is experimental software. Start with test coins, keep your recovery phrase safe, and never share it.')}<div class="footer-links"><button data-action="external" data-url="https://connectcoincrypto.com/">Meet ConnectCoin ↗</button><button data-action="external" data-url="https://discord.gg/JYWbz5PsPp">Need a hand? ↗</button></div>`;
+    const recovering = replacement?.mode === 'recover';
+    content = `<button class="back-button" data-action="auth-back">${icon('back')} Back</button><div class="eyebrow">${restore ? 'A FAMILIAR PLACE' : 'LET’S GET YOU STARTED'}</div><h2>${recovering ? 'Restore access to your wallet.' : restore ? 'Welcome home.' : 'A wallet of your own.'}</h2><p class="card-description">${restore ? 'Restore with your 12, 18 or 24 recovery words. Your new password protects this device only.' : 'Give your wallet a name and protect it with a password. Next, we’ll back up your recovery words.'}</p>${replacement ? notice('Your current wallet stays untouched until you finish. Its encrypted file will be preserved in <strong>wallet-backups</strong>; that copy still needs its original password. A different recovery phrase opens a different wallet.') : ''}${errorSlot()}<form class="auth-form" id="${restore ? 'restore' : 'create'}-form"><label class="field"><span class="field-label">Wallet name</span><input class="input" name="name" id="setup-name" placeholder="My ConnectCoin wallet" maxlength="40" required></label>${restore ? '<label class="field"><span class="field-label">Recovery phrase</span><textarea class="textarea" id="restore-phrase" name="mnemonic" spellcheck="false" autocomplete="off" autocapitalize="none" placeholder="Enter your words in order, separated by spaces" required></textarea></label>' : '<div class="field-label">Recovery phrase length</div><div class="choice-row">'+[12,18,24].map(count => `<label class="choice"><input type="radio" name="wordCount" value="${count}" ${count === 24 ? 'checked' : ''}><span>${count} words</span></label>`).join('')+'</div>'}${passwordField('setup-password','Create a password')}${passwordField('setup-confirm','Confirm password',true)}<p class="field-help">Use at least 12 characters. This is an encryption password, not an additional BIP39 passphrase.</p><div class="form-actions"><button class="button full" data-busy type="submit">${recovering ? 'Restore wallet and reset password' : restore ? 'Restore wallet' : 'Create recovery phrase'} ${icon('arrow')}</button></div></form>`;
+  } else if (replacement) content = `<button class="back-button" data-action="cancel-replacement">${icon('back')} Keep current wallet</button><div class="eyebrow">A FRESH WORKSPACE</div><h2>Choose your next wallet.</h2><p class="card-description">Create a new wallet or restore one with its recovery phrase. Your current wallet will not be replaced until you finish.</p>${errorSlot()}<div class="auth-actions"><button class="button full" data-action="auth-create">Create a new wallet ${icon('arrow')}</button><button class="button secondary full" data-action="auth-restore">I already have a recovery phrase</button></div>${notice('The previous encrypted wallet will be kept in <strong>wallet-backups</strong>. It still needs its original password. Creating another wallet does not transfer or recover funds from the previous one.')}`;
+  else content = `<div class="eyebrow">CONNECTCOIN, A LITTLE CLOSER.</div><h2>Hello, connection.</h2><p class="card-description">A calm home for your ConnectCoin. Send, receive and explore Pay-to-Connect — without a full node.</p>${errorSlot()}<div class="auth-actions"><button class="button full" data-action="auth-create">Create a new wallet ${icon('arrow')}</button><button class="button secondary full" data-action="auth-restore">I already have a recovery phrase</button></div>${notice('<strong>Welcome to testnet.</strong> This is experimental software. Start with test coins, keep your recovery phrase safe, and never share it.')}<div class="footer-links"><button data-action="external" data-url="https://connectcoincrypto.com/">Meet ConnectCoin ↗</button><button data-action="external" data-url="https://discord.gg/JYWbz5PsPp">Need a hand? ↗</button></div>`;
   app.innerHTML = `<div class="auth-shell"><section class="auth-art">${brand()}<div><h1>A beautiful way<br>to <em>connect.</em></h1><p>A little less complexity.<br>A little more possibility.<br>Your ConnectCoin journey starts here.</p></div><div class="auth-art-footer">YOUR KEYS. YOUR COINS. YOUR CONNECTION.</div><div class="auth-orb">${orb()}</div></section><main class="auth-card-wrap"><div class="auth-content">${content}</div></main></div>`;
 }
 function renderBackup() {
@@ -205,6 +245,17 @@ function closeModal() {
   if (dialog.open) dialog.close();
   dialog.innerHTML = '';
 }
+function requestReplacement(mode) {
+  const recovering = mode === 'recover';
+  openModal(recovering ? 'Restore access to your wallet.' : 'Use another wallet.',
+    recovering ? 'You need your original 12, 18 or 24 recovery words. There is no password reset by email or support.' : 'You can create a new wallet or import another recovery phrase on this device.',
+    `${notice('<strong>Your current wallet is not removed now.</strong> Only after a valid restoration or a verified new backup will Beauty preserve the old encrypted file in <strong>wallet-backups</strong> and replace the active wallet.')}<p class="field-help">The preserved copy still needs its original password. Without your recovery words or another working access method, starting over does not recover the old funds.</p><label class="checkbox recovery-confirm"><input id="replacement-ack" type="checkbox"> I understand that another wallet has different keys and the preserved encrypted copy still needs its original password.</label><div class="modal-actions"><button class="button secondary" data-action="close-modal">Cancel</button><button class="button" data-action="begin-replacement" data-mode="${mode}" data-busy data-unavailable="true" disabled>Continue</button></div>`, 'replacement');
+}
+async function cancelReplacement() {
+  const next = await invoke('cancelWalletReplacement');
+  replacement = null; setup = null; authView = 'welcome';
+  closeModal(); acceptState(next); render();
+}
 function sendReview(preview) {
   currentPreview = preview;
   openModal('One final look.', 'Check every detail. Your wallet will sign and broadcast only after you confirm.', `<dl><div class="review-line address"><dt>${preview.type === 'p2c' ? 'Bounty domain' : 'Sending to'}</dt><dd>${e(preview.address)}</dd></div><div class="review-line"><dt>${preview.type === 'p2c' ? 'Public reward' : 'Amount'}</dt><dd>${e(cc(preview.amount))}</dd></div>${preview.type === 'p2c' ? `<div class="review-line"><dt>Expected candidates</dt><dd>${e(draft.send.expectedConnections)}</dd></div>` : ''}<div class="review-line"><dt>Network fee</dt><dd>${e(cc(preview.fee))}</dd></div><div class="review-line review-total"><dt>Total</dt><dd>${e(cc(preview.total))}</dd></div></dl>${notice(preview.type === 'p2c' ? 'This public reward can be spent by any eligible claimer. It is not a payment to the domain owner. Confirmed transactions cannot be reversed.' : 'This payment is on ConnectCoin testnet. Confirmed payments cannot be reversed.')}<div class="modal-actions"><button class="button secondary" data-action="close-modal">Go back</button><button class="button" data-action="confirm-send" data-busy>${preview.type === 'p2c' ? 'Create bounty' : 'Confirm & send'} ${icon('send')}</button></div>`, 'send');
@@ -212,6 +263,10 @@ function sendReview(preview) {
 
 document.addEventListener('input', event => {
   const target = event.target;
+  if (target.id === 'replacement-ack') {
+    const button = $('[data-action="begin-replacement"]');
+    if (button) { button.dataset.unavailable = String(!target.checked); button.disabled = busy || !target.checked; }
+  }
   if (target.dataset.draft) {
     const [section, key] = target.dataset.draft.split('.');
     if (Object.hasOwn(draft, section)) draft[section][key] = target.value;
@@ -244,7 +299,12 @@ document.addEventListener('click', event => {
   const action = button.dataset.action;
   if (!action) return;
   if (action === 'auth-create' || action === 'auth-restore') { authView = action.slice(5); render(); return; }
-  if (action === 'auth-back') { authView = 'welcome'; render(); return; }
+  if (action === 'auth-back') {
+    if (replacement?.mode === 'recover') void run(cancelReplacement);
+    else { authView = 'welcome'; render(); }
+    return;
+  }
+  if (action === 'forgot-password' || action === 'replace-wallet') { requestReplacement(action === 'forgot-password' ? 'recover' : 'switch'); return; }
   if (action === 'show-password') {
     const field = document.getElementById(button.dataset.target); field.type = field.type === 'password' ? 'text' : 'password';
     button.setAttribute('aria-label', field.type === 'password' ? 'Show password' : 'Hide password'); return;
@@ -260,6 +320,16 @@ document.addEventListener('click', event => {
   }
   void run(async () => {
     switch (action) {
+      case 'begin-replacement': {
+        if (!$('#replacement-ack')?.checked) throw new Error('Please confirm you understand how wallet recovery and replacement work.');
+        const mode = button.dataset.mode;
+        const prepared = await invoke('beginWalletReplacement', { mode });
+        const next = await invoke('getState');
+        if (!next.replacementActive || next.replacementMode !== mode || typeof prepared.replacementId !== 'string') throw new Error('Wallet replacement was cancelled. Please start again.');
+        acceptState(next); replacement = { replacementId: prepared.replacementId, mode };
+        setup = null; authView = mode === 'recover' ? 'restore' : 'welcome'; closeModal(); render(); break;
+      }
+      case 'cancel-replacement': await cancelReplacement(); break;
       case 'lock': await invoke('lock'); await reload(); break;
       case 'refresh': await invoke('refresh'); await reload(); toast('Wallet refreshed.'); break;
       case 'open-diagnostics': await invoke('openDiagnostics'); break;
@@ -298,11 +368,12 @@ document.addEventListener('submit', event => {
     switch (form.id) {
       case 'create-form':
       case 'restore-form': {
+        const replacementId = replacement?.replacementId;
         if (values.password !== values.passwordConfirm) throw new Error('Your passwords don’t match. Please check them.');
         if (values.password.length < 12) throw new Error('Use a password with at least 12 characters.');
         if (form.id === 'create-form') {
           const securityEpoch = state.securityEpoch;
-          const prepared = await invoke('prepareWallet', { name: values.name.trim(), password: values.password, wordCount: Number(values.wordCount) });
+          const prepared = await invoke('prepareWallet', { name: values.name.trim(), password: values.password, wordCount: Number(values.wordCount), ...(replacementId ? { replacementId } : {}) });
           if (state.securityEpoch !== securityEpoch) throw new Error('Wallet was locked during setup. Start again when you are ready.');
           const words = Array.isArray(prepared.mnemonic) ? prepared.mnemonic : String(prepared.mnemonic ?? '').trim().split(/\s+/);
           if (!prepared.setupId || ![12,18,24].includes(words.length) || !Array.isArray(prepared.checkIndexes) || prepared.checkIndexes.length !== 3 || prepared.checkIndexes.some(index => !Number.isInteger(index) || index < 0 || index >= words.length)) throw new Error('Could not prepare a safe recovery backup. Please try again.');
@@ -310,7 +381,9 @@ document.addEventListener('submit', event => {
         } else {
           const mnemonic = values.mnemonic.trim().toLowerCase().replace(/\s+/g, ' ');
           if (![12,18,24].includes(mnemonic.split(' ').length)) throw new Error('Enter exactly 12, 18 or 24 recovery words.');
-          await invoke('restoreWallet', { name: values.name.trim(), password: values.password, mnemonic }); form.reset(); await reload(); toast('Your wallet is restored.');
+          await invoke('restoreWallet', { name: values.name.trim(), password: values.password, mnemonic, ...(replacementId ? { replacementId } : {}) });
+          form.reset(); await reload();
+          toast(replacementId ? 'Wallet restored. Previous encrypted wallet preserved in wallet-backups.' : 'Your wallet is restored.');
         }
         values.password = ''; values.passwordConfirm = ''; values.mnemonic = ''; break;
       }
@@ -346,12 +419,20 @@ document.addEventListener('submit', event => {
 });
 dialog.addEventListener('cancel', event => { event.preventDefault(); if (!busy) closeModal(); });
 document.addEventListener('keydown', event => {
+  if (['Enter', ' '].includes(event.key) && event.target.closest('button, select')) actionKeyActive = true;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'l' && state.phase === 'unlocked') { event.preventDefault(); void run(async () => { await invoke('lock'); await reload(); }); }
 });
+document.addEventListener('keyup', () => { actionKeyActive = false; });
+document.addEventListener('pointerdown', () => { pointerActive = true; }, { capture: true });
+document.addEventListener('pointerup', () => { pointerActive = false; }, { capture: true });
+document.addEventListener('pointercancel', () => { pointerActive = false; });
+document.addEventListener('compositionstart', () => { compositionActive = true; });
+document.addEventListener('compositionend', () => { compositionActive = false; });
+window.addEventListener('blur', () => { pointerActive = false; actionKeyActive = false; compositionActive = false; });
 document.addEventListener('visibilitychange', () => { if (document.hidden && modalKind === 'secret') closeModal(); });
-window.addEventListener('beforeunload', () => { unsubscribe?.(); setup = null; currentPreview = null; clearTimeout(secretTimer); });
+window.addEventListener('beforeunload', () => { unsubscribe?.(); setup = null; replacement = null; currentPreview = null; clearTimeout(secretTimer); clearTimeout(renderTimer); });
 
 render();
-if (bridge?.onState) unsubscribe = bridge.onState(acceptState);
+if (bridge?.onState) unsubscribe = bridge.onState(next => acceptState(next, { background: true }));
 if (bridge?.invoke) void invoke('getState').then(next => { state = { ...state, phase: '' }; acceptState(next); }).catch(showError);
 else showError(new Error('Desktop preview only. Wallet actions are available in the Beauty Wallet app.'));

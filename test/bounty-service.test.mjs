@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { discoverBounties, readBountyBlock } from '../src/core/bounty-discovery.mjs';
 import { DEFAULT_CONFIG, GENESIS } from '../src/core/config.mjs';
 import { WalletService } from '../src/core/wallet-service.mjs';
+import { StatePublisher } from '../src/core/state-publisher.mjs';
 import { serializeTransaction, transactionId } from '../src/core/transaction.mjs';
 import { deriveAccount } from '../src/core/crypto.mjs';
 
@@ -183,6 +184,60 @@ test('epoch cancellation prevents partial block data escaping discovery', async 
   const f = fixture({ changes() { current = false; return page('c0'); } });
   await assert.rejects(f.run({ check: () => { if (!current) throw new Error('Wallet locked'); } }), /locked/);
   assert.equal(f.calls.filter(call => call.method === 'getblockbounties').length, 0);
+});
+
+test('real discovery of thousands of mostly spent bounties publishes bounded snapshots across repeated refreshes', async () => {
+  const rows = new Map([100, 101, 102].map(height => [hash(height + 1), Array.from({ length: 1000 }, (_, vout) => row(height, {
+    txid: hash(900 + height), vout, status: vout < 990 ? 'spent' : 'available',
+    spending_txid: vout < 990 ? hash(950) : null,
+  }))]));
+  const f = fixture({ height: 620, rows });
+  const service = new WalletService({ directory: '/unused-unit-test', proofRunner: async () => '020100' });
+  service.config = structuredClone(DEFAULT_CONFIG);
+  service.walletExists = true; service.session = { data: { name: 'Fixture', receiveIndex: 0 } }; service.epoch = 1;
+  service.rpc = f.rpc;
+  service.createEngine(); service.engine.enabled = true;
+  // Exercise discovery and the real queue, but never start an external TLS proof.
+  let kicks = 0, notifications = 0, snapshots = 0, time = 0;
+  service.engine.kick = () => { kicks++; };
+  const onState = service.engine.onState;
+  service.engine.onState = value => { notifications++; onState(value); };
+  const getState = service.getState.bind(service);
+  service.getState = () => { snapshots++; return getState(); };
+  const timers = new Map(), states = [];
+  service.statePublisher.close();
+  service.statePublisher = new StatePublisher({ publish: () => service.emit('state', service.getState()), now: () => time,
+    setTimer: callback => { const timer = { unref() {} }; timers.set(timer, callback); return timer; },
+    clearTimer: timer => timers.delete(timer) });
+  service.on('state', value => states.push(value));
+  const flush = () => { time += 200; for (const [timer, callback] of [...timers]) if (timers.delete(timer)) callback(); };
+  try {
+    await service.syncBounties();
+    assert.equal(service.claimOutpoints.size, 3000);
+    assert.equal(service.engine.queue.size, 30);
+    assert.equal(notifications, 2, 'initial reset and thirty new queue entries; no notifications for 2,970 absent spent entries');
+    assert.equal(snapshots, 1, 'snapshot construction is coalesced before serialization');
+    assert.equal(timers.size, 1);
+    flush();
+    assert.equal(snapshots, 2);
+    assert.equal(states.at(-1).claims.queued, 30);
+    assert.equal(states.at(-1).claims.scanning, false);
+    const reads = f.calls.filter(call => call.method === 'getblockbounties').length;
+    for (let i = 0; i < 20; i++) await service.syncBounties();
+    assert.equal(notifications, 2, 'repeated cached scans neither remove absent entries nor re-enqueue unchanged entries');
+    assert.equal(service.engine.queue.size, 30);
+    assert.equal(f.calls.filter(call => call.method === 'getblockbounties').length, reads);
+    assert.equal(snapshots, 2);
+    assert.equal(timers.size, 1);
+    flush();
+    assert.equal(snapshots, 3);
+    assert.equal(states.at(-1).claims.queued, 30);
+    assert.equal(states.at(-1).claims.scanning, false);
+    assert.ok(kicks >= 21, 'unchanged scans still allow waiting claim work to resume');
+  } finally {
+    service.statePublisher.close();
+    await service.engine.stop();
+  }
 });
 
 function serviceFixture() {
