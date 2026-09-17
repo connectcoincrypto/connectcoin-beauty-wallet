@@ -9,9 +9,13 @@ export const GENESIS = Object.freeze({
 });
 export const DEFAULT_CONFIG = Object.freeze({
   version: 1, network: 'testnet4', rpc: Object.freeze({ host: 'connectcoin4.com', port: 48190 }),
-  claims: Object.freeze({ maxConnectionsPerSecond: 5, maxConcurrent: 5, lookbackBlocks: 600 }),
-  autoLockMinutes: 15, feeRate: 1500,
+  claims: Object.freeze({ maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 }),
+  autoLockMinutes: 15, feeRate: 1500, theme: 'system',
 });
+export function validateTheme(theme) {
+  if (!['system', 'light', 'dark'].includes(theme)) throw new Error('Choose System, Light or Dark appearance.');
+  return theme;
+}
 function integer(value, min, max, name) {
   if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer between ${min} and ${max}.`);
   return value;
@@ -38,7 +42,7 @@ export function validateConfig(input, { allowRegtest = false } = {}) {
   if (merged.version !== 1) throw new Error('Unsupported configuration version.');
   if (merged.network !== 'testnet4' && !(allowRegtest && merged.network === 'regtest')) throw new Error('This release supports ConnectCoin testnet4 only.');
   return {
-    version: 1, network: merged.network,
+    version: 1, network: merged.network, theme: validateTheme(merged.theme),
     rpc: validateRpcEndpoint(merged.rpc),
     claims: {
       maxConnectionsPerSecond: integer(merged.claims.maxConnectionsPerSecond, 1, 256, 'Connection starts per second'),

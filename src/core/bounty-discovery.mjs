@@ -45,7 +45,7 @@ export async function readBountyBlock({ rpc, network, hash, height, check = () =
 }
 
 /** Stage the complete window, replay every journal page, then publish atomically. */
-export async function discoverBounties({ rpc, network, lookback = 600, previous = new Map(), cursor = null, check = () => {}, onInvalidate = () => {}, onReset = async () => {}, readBlock }) {
+export async function discoverBounties({ rpc, network, lookback = 600, previous = new Map(), cursor = null, check = () => {}, onInvalidate = () => {}, onWindow = () => {}, onReset = async () => {}, readBlock }) {
   if (!Number.isInteger(lookback) || lookback < 1 || lookback > 600) throw new Error('Invalid bounty lookback.');
   let cached = new Map(previous);
   for (let restart = 0; restart < 4; restart++) {
@@ -60,8 +60,16 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
     const readWindow = async () => {
       snapshot = await query('getrecentblockhashes');
       wanted = windowFrom(snapshot, network, lookback); desired = new Set(wanted.map(block => block.hash));
+      onWindow(snapshot);
+      const canonical = new Map(snapshot.blocks.map(block => [block.height, block.hash]));
+      const oldest = snapshot.blocks.at(-1).height;
       for (const [hash, rows] of staged) if (!desired.has(hash)) {
-        for (const row of rows) onInvalidate(row);
+        for (const row of rows) {
+          // Use the full API window, not just the selected lookback: a replaced
+          // block at a known height is a reorg, never an ordinary aging event.
+          const agedOut = row.block_height < oldest || canonical.get(row.block_height) === hash;
+          onInvalidate(row, agedOut ? 'window_exit' : 'reorg');
+        }
         budget.count -= rows.length; staged.delete(hash); dirty.delete(hash);
       }
     };
@@ -81,7 +89,7 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
         lastSequence = event.sequence;
         const hash = event.block_hash ?? outpoints.get(bountyKey(event));
         if (hash && desired.has(hash) && event.type !== 'window_exit') dirty.add(hash);
-        if (['spent','pending_spend','window_exit'].includes(event.type)) onInvalidate(event);
+        if (['spent','pending_spend','window_exit'].includes(event.type)) onInvalidate(event, event.type);
       }
     };
     const loadDirty = async () => {

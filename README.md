@@ -14,8 +14,9 @@ A calmer home for ConnectCoin. **Beauty Wallet is a desktop light wallet**: it k
 - Create Pay-to-Connect bounties with a domain, reward and hash target, expressed as an expected number of candidate evaluations—not a guaranteed count of physical connections.
 - Opt into **Automatic Claims**, with local TLS proof generation and local proof verification.
 - Browse balances and transaction history, create receive addresses, export an encrypted backup and lock your wallet.
+- Use a light or dark interface. **System** is the default and follows your operating system automatically; override it in **Settings → Appearance**. Your choice is saved without interrupting Automatic Claims or reconnecting RPC.
 
-Automatic Claims are **off by default**, stop when the wallet locks, and are not resumed automatically after an unlock or app restart. Defaults are **5 connection starts per second and 5 simultaneous connections**. Values over 100 show a warning; the local maximum is 256. The configurable discovery window is 1–600 recent blocks, matching the public API. These are network-intensive tasks, not CPU mining. Only interact with destinations you are authorized to test; rewards are not guaranteed, and other claimers may spend a bounty first.
+Automatic Claims are **off by default**, stop when the wallet locks, and are not resumed automatically after an unlock or app restart. Defaults are **100 connection starts per second and 100 simultaneous connections**; existing saved limits are preserved. Values over 100 show a warning; the local maximum is 256. The configurable discovery window is 1–600 recent blocks, matching the public API. These are network-intensive tasks, not CPU mining. Only interact with destinations you are authorized to test; rewards are not guaranteed, and other claimers may spend a bounty first.
 
 ## Run from source
 
@@ -83,6 +84,8 @@ Locking drops the decrypted session, invalidates payment reviews and stops claim
 ## Automatic Claims architecture
 
 The main process requests recent block hashes and complete bounty streams. Partial streams are rejected; journal updates and reorganizations are reconciled. Metadata is limited to the server's recent window, but address history is chain-wide.
+
+The lookback window selects new work; it does not expire P2C outputs. An attempt already preparing, searching or submitting may finish after its bounty leaves that window. Unstarted candidates leave the discovery queue, and an aged-out attempt is not retried after failure. Known spends, reorganizations, resynchronization and wallet locking still cancel affected work. The wallet uses the validated chain median time from its shared wallet/discovery refresh for proof preparation, without two extra chain-tip requests per claim; the full node validates the submitted proof against its own current consensus state.
 
 For each candidate, funding bytes are verified locally. An immutable spending transaction is prepared before TLS work. The **spending transaction ID**, input index, domain, target, allowed signature schemes, pinned roots and chain median time define the proof context. No private wallet data is passed to the helper. A verified proof is attached without changing the prepared transaction's non-witness data.
 

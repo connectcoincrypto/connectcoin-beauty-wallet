@@ -1,1 +1,83 @@
-:root{--canvas:#f7f6f2;--paper:#fffefa;--ink:#292432;--muted:#716b78;--subtle:#79727f;--line:#e8e4dc;--wash:#f2efe8;--violet:#8061c5;--lime:#d2ef9b;--font:"Segoe UI Variable Display","Segoe UI",-apple-system,BlinkMacSystemFont,sans-serif;--mono:"Cascadia Code","SFMono-Regular",Consolas,monospace}
+/* Native color-scheme is configured before the window opens. System follows
+   the operating system live; explicit preferences also work in the renderer. */
+:root {
+  color-scheme: light dark;
+  --canvas: light-dark(#f7f6f2, #17151e);
+  --paper: light-dark(#fffefa, #211e29);
+  --sidebar: light-dark(#faf9f5, #1b1822);
+  --ink: light-dark(#292432, #f1edf7);
+  --muted: light-dark(#716b78, #b7aebe);
+  --subtle: light-dark(#746c79, #afa4ba);
+  --line: light-dark(#e8e4dc, #3d354a);
+  --wash: light-dark(#f2efe8, #2c2635);
+  --surface-alt: light-dark(#fdfcf9, #25212e);
+  --surface-inset: light-dark(#f6f4ef, #1b1822);
+  --surface-hover: light-dark(#eeece6, #312a3c);
+  --input-bg: light-dark(#fcfbf8, #1b1822);
+  --placeholder: light-dark(#79717e, #9b90a6);
+  --violet: light-dark(#7453bc, #c3a7f5);
+  --focus: light-dark(#c8b7ee, #765c9e);
+  --primary-bg: light-dark(#7453bc, #b799ed);
+  --primary-hover: light-dark(#6345af, #c8adf5);
+  --primary-ink: light-dark(#ffffff, #251935);
+  --brand-bg: #8061c5;
+  --brand-ink: #ffffff;
+  --brand-shadow: light-dark(#7155c329, #0000002e);
+  --nav-active-bg: light-dark(#292432, #3b304e);
+  --nav-active-ink: #f8f5fd;
+  --ink-button-bg: light-dark(#292432, #d9c9ef);
+  --ink-button-ink: light-dark(#ffffff, #251935);
+  --ink-button-hover: light-dark(#43394f, #eadcfb);
+  --lime: #d2ef9b;
+  --lime-hover: #daf98d;
+  --lime-ink: #24301b;
+  --soft-violet: light-dark(#f0ebfa, #30263e);
+  --soft-violet-border: light-dark(#e2d9f1, #4f3e64);
+  --soft-violet-ink: light-dark(#74608c, #c9b4e6);
+  --profile-bg: light-dark(#e6e1f2, #493957);
+  --promo-bg: light-dark(#292432, #2c223b);
+  --promo-ink: #f8f5fd;
+  --promo-accent: #cbb5ee;
+  --promo-muted: #c8c1d4;
+  --promo-art: #aa8ec8;
+  --orb-lime: #d2ef9b;
+  --orb-violet: #b9a5e2;
+  --positive-bg: light-dark(#edf3e9, #24352c);
+  --positive-ink: light-dark(#50713c, #b3d9a0);
+  --pending-bg: light-dark(#f8efdb, #3a3020);
+  --pending-ink: light-dark(#826427, #e5c580);
+  --offline-dot: light-dark(#c6a458, #dfbc72);
+  --online-dot: light-dark(#639779, #8fc7a3);
+  --online-ring: light-dark(#62997715, #8fc7a31a);
+  --empty-bg: light-dark(#faf8ff, #292232);
+  --empty-ink: light-dark(#9c94b2, #b1a0ca);
+  --warning-bg: light-dark(#faf5e8, #342d21);
+  --warning-border: light-dark(#e9dcba, #685438);
+  --warning-ink: light-dark(#826a37, #e2c589);
+  --danger-bg: light-dark(#fff0ee, #392329);
+  --danger-border: light-dark(#efbab4, #74414c);
+  --danger-ink: light-dark(#96372f, #ffb6ae);
+  --danger-button-bg: light-dark(#a3383f, #eea4ad);
+  --danger-button-ink: light-dark(#ffffff, #38151e);
+  --danger-button-hover: light-dark(#892e35, #f6bcc3);
+  --auth-bg: light-dark(#e8e2f2, #241d31);
+  --auth-muted: light-dark(#6b5e77, #c0b0d2);
+  --auth-foot: light-dark(#6b5e77, #b29bc8);
+  --auth-art: light-dark(#b7a4d1, #70518b);
+  --switch-track: light-dark(#ccc5d4, #665a75);
+  --switch-knob: #ffffff;
+  --switch-active: light-dark(#7453bc, #9973cf);
+  --filter-active: light-dark(#ffffff, #40334f);
+  --toast-bg: light-dark(#292432, #e6ddf6);
+  --toast-ink: light-dark(#ffffff, #251c36);
+  --shadow-soft: light-dark(#25232b0d, #00000026);
+  --shadow-knob: light-dark(#25232b22, #0000004d);
+  --shadow-dialog: light-dark(#20153033, #00000066);
+  --shadow-toast: light-dark(#20202b25, #0000004d);
+  --backdrop: light-dark(#21193155, #07050bb3);
+  --qr-bg: #ffffff;
+  --font: "Segoe UI Variable Display", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+  --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }

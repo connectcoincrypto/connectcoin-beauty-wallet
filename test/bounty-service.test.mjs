@@ -142,6 +142,7 @@ function serviceFixture() {
   const service = new WalletService({ directory: '/unused-unit-test' });
   service.config = structuredClone(DEFAULT_CONFIG);
   service.session = { data: {} }; service.epoch = 7;
+  service.tip = tip(1);
   service.engine = { enabled: true, stopped: 0, async stop() { this.enabled = false; this.stopped++; } };
   service.claimBlocks.set(hash(2), [bounty]); service.claimOutpoints = new Map([[`${bounty.txid}:0`, bounty]]);
   service.getState = () => ({ wallet: { address: account.address } });
@@ -167,10 +168,10 @@ test('prepared claims bind a spending txid and reject RPC metadata differing fro
   await assert.rejects(service.prepareAutomaticClaim(bounty), /domain differs/);
 });
 
-test('lock during claim preparation aborts before requesting funding or opening any TLS connection', async () => {
+test('lock during funding lookup aborts claim preparation before opening any TLS connection', async () => {
   const { service, bounty } = serviceFixture();
-  service.funding = async () => { throw new Error('Funding must not be fetched after locking'); };
-  service.rpc.request = async () => { service.epoch++; service.session = null; return tip(1); };
+  const funding = service.funding;
+  service.funding = async () => { service.epoch++; service.session = null; return funding(); };
   await assert.rejects(service.prepareAutomaticClaim(bounty), /locked|changed/i);
 });
 

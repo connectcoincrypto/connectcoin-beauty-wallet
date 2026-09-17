@@ -122,3 +122,30 @@ test('lock emits cleared secrets before slow helper shutdown and close drains en
   finishWrite();await closing;assert.equal(closed,true);
   s.engine.stop=originalStop;
 });
+
+test('appearance persists without touching the wallet, connection, claims or payment review',async t=>{
+  const s=await fixture(t);await create(s);
+  const epoch=s.epoch, rpc=s.rpc, engine=s.engine;
+  const encrypted=await readFile(s.vaultFile,'utf8');
+  const preview=s.preview={previewId:'preserve-me',epoch};
+  engine.start();
+  for(const theme of ['dark','light','system']) {
+    const result=await s.setTheme({theme});
+    assert.equal(result.config.theme,theme);
+    assert.equal(s.epoch,epoch);assert.equal(s.rpc,rpc);assert.equal(s.engine,engine);
+    assert.equal(engine.enabled,true);assert.equal(s.preview,preview);
+    assert.equal(await readFile(s.vaultFile,'utf8'),encrypted);
+    assert.equal(JSON.parse(await readFile(join(s.directory,'config.json'),'utf8')).theme,theme);
+  }
+  await assert.rejects(s.setTheme({theme:'invalid'}),/appearance/);
+  assert.equal(s.config.theme,'system');assert.equal(s.preview,preview);
+});
+
+test('appearance can be saved before onboarding or while locked, without exposing a session',async t=>{
+  const s=await fixture(t);
+  await s.setTheme({theme:'dark'});assert.equal(s.getState().phase,'welcome');
+  assert.equal(s.session,null);assert.equal(s.walletExists,false);
+  await create(s);await s.lock();
+  await s.setTheme({theme:'light'});assert.equal(s.getState().phase,'locked');
+  assert.equal(s.session,null);assert.equal(s.getState().wallet,null);
+});

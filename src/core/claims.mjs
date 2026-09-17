@@ -7,7 +7,7 @@ const BASE = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const CONTEXT_KEYS = ['domain', 'txid', 'input_index', 'connection_work_target', 'root_certificates_version', 'signature_algorithms_mask', 'validation_time'];
 const HASH = /^[0-9a-f]{64}$/;
 const DOMAIN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-export const DEFAULT_CLAIM_OPTIONS = Object.freeze({ connectionsPerSecond: 5, concurrency: 5, overallTimeout: 180, maxAttempts: 1000 });
+export const DEFAULT_CLAIM_OPTIONS = Object.freeze({ connectionsPerSecond: 100, concurrency: 100, overallTimeout: 180, maxAttempts: 1000 });
 
 function integer(value, minimum, maximum, name) {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) throw new Error(`Invalid ${name}`);
@@ -196,6 +196,14 @@ export class ClaimsEngine {
     if (this.activeKey === key) this.controller?.abort();
     this.notify();
   }
+  retire(txid, vout) {
+    const key = `${txid}:${vout}`, job = this.queue.get(key);
+    // Leaving discovery is not consensus expiry. Let the current attempt finish,
+    // but do not start or retry work we can no longer monitor in that window.
+    if (job && this.activeKey === key) job.retired = true;
+    else this.queue.delete(key);
+    this.notify();
+  }
   clear() {
     this.queue.clear();
     this.completed.clear();
@@ -272,9 +280,11 @@ export class ClaimsEngine {
         this.notify({ status: this.enabled ? 'retrying' : 'off', lastError: String(error.message || error).slice(0, 500) });
       }
     }).finally(() => {
+      if (job.retired && this.queue.get(key) === job) this.queue.delete(key);
       this.running = null;
       this.controller = null;
       this.activeKey = null;
+      this.notify();
       this.kick();
     });
   }

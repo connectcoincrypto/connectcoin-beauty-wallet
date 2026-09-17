@@ -10,7 +10,8 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 async function until(predicate) { for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise((resolve) => setTimeout(resolve, 2)); } throw new Error('Timed out waiting for claims state'); }
 
 test('claims options are finite and public context cannot smuggle private fields', () => {
-  assert.equal(validateClaimOptions().concurrency, 5);
+  assert.equal(validateClaimOptions().concurrency, 100);
+  assert.equal(validateClaimOptions().connectionsPerSecond, 100);
   for (const options of [{ concurrency: 0 }, { concurrency: 257 }, { connectionsPerSecond: -1 }, { overallTimeout: Infinity }, { maxAttempts: 0 }, { allowPrivate: true }]) assert.throws(() => validateClaimOptions(options));
   for (const delta of [{ domain: '127.0.0.1/evil' }, { domain: 'wallet.local' }, { domain: 'EXAMPLE.com' }, { domain: 'localhost' }, { root_certificates_version: 2 }, { signature_algorithms_mask: 0 }, { validation_time: 0 }, { password: 'not permitted' }]) assert.throws(() => validateClaimContext({ ...context(), ...delta }));
   assert.deepEqual(validateClaimContext(context()), context());
@@ -46,6 +47,8 @@ test('proof runner sends only public context via stdin, no shell; requires verif
   assert.equal(fixture.capture.options.env.CONNECTCOIN_RPC_PASSWORD, undefined);
   assert.deepEqual(Object.keys(fixture.capture.request).sort(), ['context', 'options']);
   assert.equal(fixture.capture.request.context.txid, context().txid);
+  assert.equal(fixture.capture.request.options.connectionsPerSecond, 100);
+  assert.equal(fixture.capture.request.options.concurrency, 100);
 });
 
 test('proof runner rejects tampered contexts, oversized frames, unknown messages, partial output, and nonzero exit', async () => {

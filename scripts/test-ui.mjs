@@ -16,7 +16,9 @@ const screenshots = await mkdtemp(path.join(tmpdir(), 'beauty-wallet-ui-screens-
 const tip = { chain: 'testnet4', height: 0, hash: GENESIS.testnet4, genesis_hash: GENESIS.testnet4, mediantime: 1780000000 };
 const requests = [];
 const sockets = new Set();
+let connectionCount = 0;
 const fixture = net.createServer(socket => {
+  connectionCount++;
   sockets.add(socket); socket.on('close', () => sockets.delete(socket)); socket.on('error', () => socket.destroy());
   let buffer = '';
   socket.setEncoding('utf8');
@@ -38,6 +40,8 @@ const fixture = net.createServer(socket => {
 await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve));
 await writeFile(path.join(profile, 'config.json'), JSON.stringify({ version: 1, network: 'testnet4', rpc: { host: '127.0.0.1', port: fixture.address().port }, autoLockMinutes: 15 }));
 let application;
+let page;
+const errors = [];
 let stage = 'launch';
 let passed = false;
 let seed = [];
@@ -45,20 +49,77 @@ const password = 'UI-test-only-long-password';
 const env = { ...process.env, BEAUTY_TEST_PROFILE: profile };
 delete env.ELECTRON_RUN_AS_NODE;
 
+async function openApplication(executablePath) {
+  // Disable Playwright's default forced-light emulation so this test observes
+  // Electron nativeTheme and the real application color-scheme behavior.
+  application = await electron.launch({ executablePath, args: [root], env, colorScheme: null, timeout: 30000 });
+  page = await application.firstWindow();
+  page.setDefaultTimeout(15000);
+  page.on('pageerror', error => errors.push(error.name));
+  await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
+}
+async function waitForScheme(dark) {
+  await page.waitForFunction(expected => matchMedia('(prefers-color-scheme: dark)').matches === expected, dark);
+  // Allow the media-query style recalculation and the next paint to complete.
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+}
+async function selectTheme(theme, { ui = false } = {}) {
+  if (ui) await page.locator('#theme-preference').selectOption(theme);
+  else await page.evaluate(value => window.beauty.invoke('setTheme', { theme: value }), theme);
+  await page.waitForFunction(async value => (await window.beauty.invoke('getState')).config.theme === value && document.documentElement.dataset.theme === value && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', theme);
+  // Observed Electron runs sometimes expose the new config/CSS just before the
+  // native getter agrees. Verify convergence, without assuming its cause or
+  // relaxing the requested-value assertion after this bounded wait.
+  const deadline = Date.now() + 1000;
+  let nativeSource = await application.evaluate(({ nativeTheme }) => nativeTheme.themeSource);
+  while (nativeSource !== theme && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, Math.min(25, deadline - Date.now())));
+    nativeSource = await application.evaluate(({ nativeTheme }) => nativeTheme.themeSource);
+  }
+  assert.equal(nativeSource, theme, `Native appearance must match the saved preference (${theme}).`);
+  await waitForScheme(await application.evaluate(({ nativeTheme }) => nativeTheme.shouldUseDarkColors));
+  assert.equal(JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).theme, theme);
+}
+
 try {
   // Electron 44 may download its runtime lazily. Resolve it before starting
   // Playwright's launch deadline, so a cold install is not a false UI timeout.
   const executablePath = createRequire(import.meta.url)('electron');
-  application = await electron.launch({ executablePath, args: [root], env, timeout: 30000 });
-  const page = await application.firstWindow();
-  page.setDefaultTimeout(15000);
-  const errors = [];
-  page.on('pageerror', error => errors.push(error.name));
+  await openApplication(executablePath);
   // Screenshots are deliberately limited to screens with no recovery words.
   await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
   await page.screenshot({ path: path.join(screenshots, 'welcome.png') });
   assert.deepEqual(await page.evaluate(() => [typeof window.require, typeof window.process, Object.isFrozen(window.beauty)]), ['undefined', 'undefined', true]);
   assert.equal(await page.evaluate(() => window.beauty.invoke('getblocktemplate').then(() => false, () => true)), true);
+
+  stage = 'system appearance and startup persistence';
+  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).config.theme, 'system');
+  assert.equal(await page.locator('html').getAttribute('data-theme'), 'system');
+  assert.equal(await application.evaluate(({ nativeTheme }) => nativeTheme.themeSource), 'system');
+  await waitForScheme(await application.evaluate(({ nativeTheme }) => nativeTheme.shouldUseDarkColors));
+  // Drive Electron's application-local theme source, not the operating system.
+  // With config still 'system', this exercises live CSS media-query changes.
+  await application.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'dark'; });
+  await waitForScheme(true);
+  const darkCanvas = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  await application.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'light'; });
+  await waitForScheme(false);
+  const lightCanvas = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  assert.notEqual(darkCanvas, lightCanvas);
+  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).config.theme, 'system');
+  await selectTheme('dark');
+  await page.reload();
+  await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
+  await waitForScheme(true);
+  assert.equal(await page.evaluate(() => getComputedStyle(document.body).backgroundColor), darkCanvas);
+  // A fresh Electron main process must apply the saved choice before showing
+  // the first window. The isolated profile contains no wallet yet.
+  await application.close(); application = null;
+  await openApplication(executablePath);
+  assert.equal(await application.evaluate(({ nativeTheme }) => nativeTheme.themeSource), 'dark');
+  await waitForScheme(true);
+  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).config.theme, 'dark');
+  await selectTheme('system');
 
   stage = 'create and backup';
   await page.getByRole('button', { name: 'Create a new wallet' }).click();
@@ -68,6 +129,11 @@ try {
   await page.locator('#setup-password').fill(password);
   await page.locator('#setup-confirm').fill(password);
   assert.equal(await page.locator('#setup-password').getAttribute('minlength'), '12');
+  await application.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'dark'; });
+  await waitForScheme(true);
+  assert.equal(await page.locator('#setup-name').inputValue(), 'UI smoke test');
+  assert.equal(await page.locator('#setup-password').inputValue(), password);
+  await application.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'system'; });
   await page.getByRole('button', { name: 'Create recovery phrase' }).click();
   await page.getByRole('heading', { name: 'These words are your wallet.' }).waitFor();
   assert.equal(await page.locator('.seed-word').count(), 12);
@@ -94,9 +160,41 @@ try {
   for (const index of indexes) await page.locator(`#check-${index}`).fill(seed[index]);
   await page.getByRole('button', { name: 'Open my wallet' }).click();
   await page.getByRole('heading', { name: 'A little more connected.' }).waitFor();
-  await page.waitForFunction(async () => (await window.beauty.invoke('getState')).wallet?.balance?.available === '0');
+  await page.waitForFunction(async () => {
+    const state = await window.beauty.invoke('getState');
+    return state.network.status === 'online' && !state.busy && state.wallet?.balance?.available === '0';
+  });
   assert.equal(await page.locator('.seed-word').count(), 0);
   await page.screenshot({ path: path.join(screenshots, 'overview.png') });
+
+  stage = 'appearance settings preserve wallet and drafts';
+  await page.locator('[data-view="settings"]').first().click();
+  assert.equal(await page.locator('#theme-preference').inputValue(), 'system');
+  await page.locator('#rpc-host').fill('127.0.0.2');
+  await page.locator('#auto-lock').fill('30');
+  const beforeTheme = await page.evaluate(() => window.beauty.invoke('getState'));
+  const beforeThemeConnections = connectionCount;
+  await selectTheme('dark', { ui: true });
+  const afterTheme = await page.evaluate(() => window.beauty.invoke('getState'));
+  assert.equal(afterTheme.phase, 'unlocked');
+  assert.equal(afterTheme.securityEpoch, beforeTheme.securityEpoch);
+  assert.equal(afterTheme.wallet.address, beforeTheme.wallet.address);
+  assert.equal(afterTheme.claims.enabled, beforeTheme.claims.enabled);
+  assert.deepEqual(afterTheme.config.rpc, beforeTheme.config.rpc);
+  assert.equal(afterTheme.config.autoLockMinutes, beforeTheme.config.autoLockMinutes);
+  assert.equal(connectionCount, beforeThemeConnections);
+  assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.2');
+  assert.equal(await page.locator('#auto-lock').inputValue(), '30');
+  assert.equal(await page.locator('[data-view="settings"][aria-current="page"]').count(), 1);
+  await page.screenshot({ path: path.join(screenshots, 'settings-dark.png'), fullPage: true });
+  await selectTheme('light', { ui: true });
+  assert.equal(await page.evaluate(() => getComputedStyle(document.body).backgroundColor), lightCanvas);
+  assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.2');
+  await selectTheme('system', { ui: true });
+  await selectTheme('dark', { ui: true });
+  await page.locator('[data-view="overview"]').first().click();
+  assert.equal(await page.locator('.seed-word').count(), 0);
+  await page.screenshot({ path: path.join(screenshots, 'overview-dark.png') });
 
   stage = 'receiving and bounty form';
   await page.locator('[data-view="receive"]').first().click();
@@ -109,8 +207,18 @@ try {
   await page.locator('#send-amount').fill('1');
   await page.locator('#send-expected').fill('1000');
   assert.equal(await page.getByRole('button', { name: 'Review bounty' }).isVisible(), true);
+  await selectTheme('light');
+  assert.equal(await page.locator('#send-domain').inputValue(), 'example.com');
+  assert.equal(await page.locator('#send-amount').inputValue(), '1');
+  assert.equal(await page.locator('#send-expected').inputValue(), '1000');
+  await selectTheme('dark');
+  assert.equal(await page.locator('#send-domain').inputValue(), 'example.com');
   // No funds, no broadcast: verify the form only and do not create a preview.
   await page.locator('[data-view="claims"]').first().click();
+  assert.equal(await page.locator('#claims-rate').inputValue(), '100');
+  assert.equal(await page.locator('#claims-concurrent').inputValue(), '100');
+  assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
+  assert.equal(await page.locator('#claims-warning').isVisible(), false);
   await page.locator('#claims-rate').fill('101');
   assert.equal(await page.locator('#claims-warning').isVisible(), true);
   assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
@@ -118,12 +226,17 @@ try {
   stage = 'lock and unlock';
   await page.getByRole('button', { name: 'Lock wallet', exact: true }).click();
   await page.locator('#unlock-password').waitFor();
+  await waitForScheme(true);
+  await selectTheme('light');
+  assert.equal(await page.locator('#unlock-password').isVisible(), true);
   assert.equal(await page.locator('.address-box').count(), 0);
   assert.equal(await page.locator('.seed-word').count(), 0);
   await page.locator('#unlock-password').fill(password);
   await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
   await page.locator('[data-view="settings"]').first().waitFor();
   await page.locator('[data-view="settings"]').first().click();
+  assert.equal(await page.locator('#theme-preference').inputValue(), 'light');
+  await selectTheme('dark', { ui: true });
   await page.getByRole('button', { name: 'View recovery phrase' }).click();
   await page.locator('#recovery-password').fill(password);
   await page.getByRole('button', { name: 'Reveal words' }).click();
@@ -142,10 +255,12 @@ try {
   assert.ok(!requests.includes('sendrawtransaction'));
   assert.deepEqual(errors, []);
   passed = true;
-  console.log(`PASS: real Electron isolation, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure. Screenshots: ${screenshots}`);
+  console.log(`PASS: real Electron isolation, system/light/dark appearance, restart persistence, draft preservation, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure. Screenshots: ${screenshots}`);
 } catch (error) {
   // Avoid Playwright action dumps: they could contain a generated backup word.
-  console.error(`UI smoke test failed during ${stage} (${error.name ?? 'Error'}). No recovery words were logged. Temporary profile preserved: ${profile}`);
+  const sourceLine = /test-ui\.mjs:(\d+):\d+/.exec(String(error.stack ?? ''))?.[1];
+  console.error(`UI smoke test failed during ${stage} (${error.name ?? 'Error'}${sourceLine ? `, test line ${sourceLine}` : ''}). No recovery words were logged. Temporary profile preserved: ${profile}`);
+  if (error.code === 'ERR_ASSERTION' && (stage === 'appearance settings preserve wallet and drafts' || String(error.message).startsWith('Native appearance must match'))) console.error(String(error.message).slice(0, 500));
   process.exitCode = 1;
 } finally {
   seed.fill(''); seed = [];

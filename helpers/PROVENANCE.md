@@ -32,7 +32,7 @@ signature-mask, challenge, and CertificateVerify verification. This independent
 X.509 implementation can reject some encodings accepted by Core; the node's
 consensus validation remains authoritative.
 
-Limits are finite: one bounty job at a time, default 5 starts/sec and 5
+Limits are finite: one bounty job at a time, default 100 starts/sec and 100
 simultaneous connections, maximum 256 of either, 10-second socket deadlines,
 180 seconds and 1,000 attempts per job. Automatic Claims are off by default;
 locking or stopping the wallet terminates the helper. The engine never starts

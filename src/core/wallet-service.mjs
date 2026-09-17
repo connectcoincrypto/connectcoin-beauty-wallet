@@ -4,7 +4,7 @@ import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import QRCode from 'qrcode';
 import { RpcClient } from './rpc.mjs';
-import { readConfig, writeConfig, validateConfig, validateTip } from './config.mjs';
+import { readConfig, writeConfig, validateConfig, validateTheme, validateTip } from './config.mjs';
 import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic } from './crypto.mjs';
 import { createVault, unlockVault, updateVault, validatePassword } from './vault.mjs';
 import { buildPayment, prepareClaim, attachClaimProof, parseCoinAmount, formatCoinAmount, estimateClaimFee, parseTransaction, transactionId } from './transaction.mjs';
@@ -34,7 +34,7 @@ export class WalletService extends EventEmitter {
     this.walletExists = false; this.accounts = []; this.accountCache = new Map(); this.utxos = []; this.history = [];
     this.balance = null; this.qrDataUrl = null; this.error = null; this.rpc = null;
     this.network = { status: 'offline', chain: 'testnet4', height: null };
-    this.claimBlocks = new Map(); this.claimCursor = null; this.claimInfo = {};
+    this.claimBlocks = new Map(); this.claimCursor = null; this.claimInfo = {}; this.retiredClaim = null; this.tip = null;
     this.reserved = new Set(); this.fundingCache = new Map(); this.lastActivity = Date.now(); this.persisting = Promise.resolve();
   }
   async initialize() {
@@ -52,9 +52,11 @@ export class WalletService extends EventEmitter {
   connectClient() {
     this.rpc?.close(); this.refreshing = null;
     const rpc = this.clientFactory(this.config.rpc); this.rpc = rpc;
+    this.tip = null;
     this.network = { status: 'offline', chain: this.config.network, height: null };
     rpc.on('disconnected', () => {
       if (this.rpc !== rpc) return;
+      this.tip = null;
       this.network.status = 'offline';
       this.preview = null;
       void this.engine?.stop(); this.emitState();
@@ -67,7 +69,15 @@ export class WalletService extends EventEmitter {
       prepare: (bounty, options) => this.prepareAutomaticClaim(bounty, options),
       submit: (prepared, proof, options) => this.submitAutomaticClaim(prepared, proof, options),
       options: { connectionsPerSecond: this.config.claims.maxConnectionsPerSecond, concurrency: this.config.claims.maxConcurrent },
-      onState: state => { this.claimInfo = state; this.emitState(); },
+      onState: state => {
+        this.claimInfo = state;
+        if (this.retiredClaim && this.engine?.activeKey !== this.retiredClaim.key) {
+          const { key, row } = this.retiredClaim;
+          if (this.claimOutpoints?.get(key) === row) this.claimOutpoints.delete(key);
+          this.retiredClaim = null;
+        }
+        this.emitState();
+      },
     });
   }
   getState() {
@@ -167,6 +177,7 @@ export class WalletService extends EventEmitter {
     this.epoch++; this.preview = null; this.setup = null;
     const epoch = this.epoch;
     this.session = null; this.accounts = []; this.utxos = []; this.history = []; this.balance = null; this.qrDataUrl = null;
+    this.tip = null; this.retiredClaim = null;
     this.fundingCache.clear(); this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null; this.reserved.clear(); this.accountCache.clear();
     this.rpc?.close();
     // Hide sensitive renderer state immediately, before waiting for helper shutdown.
@@ -356,6 +367,13 @@ export class WalletService extends EventEmitter {
     this.engine.setOptions({ connectionsPerSecond: config.claims.maxConnectionsPerSecond, concurrency: config.claims.maxConcurrent });
     this.emitState(); if (this.session) void this.refresh().catch(() => {}); return this.getState();
   }
+  async setTheme({ theme } = {}) {
+    validateTheme(theme);
+    // Appearance is independent of keys, RPC and claims. Do not reconnect,
+    // invalidate payment reviews or change the security epoch for a color change.
+    this.config = await writeConfig(this.directory, { ...this.config, theme }, { allowRegtest: this.allowRegtest });
+    this.emitState(); return this.getState();
+  }
   async setClaims({ enabled, maxConnectionsPerSecond, maxConcurrent, lookbackBlocks } = {}) {
     if (typeof enabled !== 'boolean') throw new Error('Choose whether Automatic Claims should be enabled.');
     this.assertSession();
@@ -424,7 +442,15 @@ export class WalletService extends EventEmitter {
     const result = await discoverBounties({
       rpc, network: this.config.network, lookback: this.config.claims.lookbackBlocks,
       previous: this.claimBlocks, cursor: this.claimCursor, check,
-      onInvalidate: row => engine.remove(row.txid, row.vout),
+      onInvalidate: (row, reason) => reason === 'window_exit' ? engine.retire(row.txid, row.vout) : engine.remove(row.txid, row.vout),
+      onWindow: snapshot => {
+        // A retained in-flight row is no longer in the discovery block cache.
+        // Still cancel it if a subsequent window reveals its block was replaced.
+        const row = this.claimOutpoints?.get(engine.activeKey);
+        if (!row) return;
+        const block = snapshot.blocks.find(block => block.height === row.block_height);
+        if (row.block_height > snapshot.tip.height || (block && block.hash !== row.block_hash)) engine.remove(row.txid, row.vout);
+      },
       onReset: async () => { await engine.suspend(); check(); engine.clear(); },
       readBlock: (hash, options) => this.blockBounties(hash, { ...options, rpc, epoch }),
     });
@@ -436,9 +462,15 @@ export class WalletService extends EventEmitter {
       if (row.status === 'available' && row.root_certificates_version === 1 && BigInt(row.amount) > fees + 100000n && !this.reserved.has(key)) available.push(row);
       else engine.remove(row.txid, row.vout);
     }
-    // Remove entries whose funding block disappeared, including reorg/window exits.
-    for (const rows of this.claimBlocks.values()) for (const row of rows) if (!outpoints.has(bountyKey(row))) engine.remove(row.txid, row.vout);
+    // Only an already-running, normally aged-out attempt can outlive discovery.
+    // Its metadata stays bounded to one entry and is released when it settles.
+    for (const [key, row] of this.claimOutpoints ?? []) if (!outpoints.has(key)) {
+      if (engine.activeKey === key && engine.queue.get(key)?.retired && !engine.controller?.signal.aborted) {
+        outpoints.set(key, row); this.retiredClaim = { key, row };
+      } else engine.remove(row.txid, row.vout);
+    }
     check(); this.claimBlocks = result.blocks; this.claimOutpoints = outpoints; this.claimCursor = result.cursor;
+    this.tip = validateTip(result.tip, this.config.network);
     engine.enqueue(available);
     check(); engine.resume();
   }
@@ -451,11 +483,12 @@ export class WalletService extends EventEmitter {
     };
     check();
     const current = this.claimOutpoints?.get(bountyKey(bounty));
-    if (!current || current.status !== 'available' || !this.claimBlocks.has(current.block_hash) || this.reserved.has(bountyKey(current))) throw new Error('This bounty is no longer eligible for claiming.');
-    const tip = validateTip(await rpc.request('getchaintip'), this.config.network); check();
-    if (current.block_height > tip.height || current.block_height < Math.max(0, tip.height - this.config.claims.lookbackBlocks + 1)) throw new Error('Bounty left the selected recent-block window.');
+    if (!current || current.status !== 'available' || this.reserved.has(bountyKey(current))) throw new Error('This bounty is no longer eligible for claiming.');
+    // The validated tip is refreshed by wallet/discovery sync, not twice per
+    // claim. MTP is a certificate-checking reference, not a bounty expiry rule.
+    const tip = validateTip(this.tip, this.config.network);
     const rawTransaction = await this.funding(current.txid); check();
-    if (this.claimOutpoints?.get(bountyKey(current))?.status !== 'available' || !this.claimBlocks.has(current.block_hash)) throw new Error('Bounty availability changed while preparing its claim.');
+    if (this.claimOutpoints?.get(bountyKey(current))?.status !== 'available') throw new Error('Bounty availability changed while preparing its claim.');
     const rewardAddress = this.getState().wallet.address;
     const prepared = prepareClaim({ bounty: current, rawTransaction, rewardAddress, fee: estimateClaimFee(this.config.feeRate), network: this.config.network });
     check();
@@ -473,9 +506,7 @@ export class WalletService extends EventEmitter {
     };
     check();
     const key = bountyKey(prepared.bounty), current = this.claimOutpoints?.get(key);
-    if (!current || current.status !== 'available' || !this.claimBlocks.has(current.block_hash) || this.reserved.has(key)) throw new Error('This bounty is no longer eligible for claiming.');
-    const tip = validateTip(await prepared.rpc.request('getchaintip'), this.config.network); check();
-    if (current.block_height > tip.height || current.block_height < Math.max(0, tip.height - this.config.claims.lookbackBlocks + 1)) throw new Error('Bounty left the selected recent-block window.');
+    if (!current || current.status !== 'available' || this.reserved.has(key)) throw new Error('This bounty is no longer eligible for claiming.');
     const signed = attachClaimProof(prepared, proof); check();
     this.reserved.add(key);
     try {

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, dialog, shell, clipboard, powerMonitor } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, dialog, shell, clipboard, powerMonitor, nativeTheme } from 'electron';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { copyFile, chmod, constants, realpath } from 'node:fs/promises';
@@ -7,9 +7,14 @@ import { WalletService } from './core/wallet-service.mjs';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const INDEX = join(ROOT, 'ui', 'index.html');
 const UI_URL = pathToFileURL(INDEX).href;
-const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','restoreWallet','unlock','lock','previewSend','confirmSend','newAddress','getRecoveryPhrase','saveConfig','setClaims','refresh']);
+const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','restoreWallet','unlock','lock','previewSend','confirmSend','newAddress','getRecoveryPhrase','saveConfig','setTheme','setClaims','refresh']);
 const EXTERNAL = new Set(['https://connectcoincrypto.com/','https://connectcoincrypto.com/whitepaper.pdf','https://explorer.connectcoincrypto.com/','https://github.com/connectcoincrypto/connectcoin-beauty-wallet','https://github.com/connectcoincrypto/connectcoin','https://discord.gg/JYWbz5PsPp']);
 let window, service, quitting = false, actionInProgress = false;
+const themeBackground = () => nativeTheme.shouldUseDarkColors ? '#17151e' : '#f7f6f2';
+function applyTheme(theme) {
+  if (nativeTheme.themeSource !== theme) nativeTheme.themeSource = theme;
+  if (window && !window.isDestroyed()) window.setBackgroundColor(themeBackground());
+}
 
 // Development UI tests use isolated temporary profiles; installed builds ignore this override.
 if (!app.isPackaged && process.env.BEAUTY_TEST_PROFILE) app.setPath('userData', resolve(process.env.BEAUTY_TEST_PROFILE));
@@ -31,10 +36,13 @@ else {
   try {
     service = new WalletService({ directory: app.getPath('userData'), resourcesPath: process.resourcesPath });
     await service.initialize();
+    // Set the saved override before the first paint; 'system' follows OS changes
+    // through Chromium's prefers-color-scheme without changing the OS setting.
+    applyTheme(service.config.theme);
     window = new BrowserWindow({
       width: 1380, height: 940, minWidth: 1000, minHeight: 700, show: false,
       icon: join(ROOT, '..', 'assets', 'icon.png'),
-      title: 'ConnectCoin Beauty Wallet', backgroundColor: '#f7f7f2',
+      title: 'ConnectCoin Beauty Wallet', backgroundColor: themeBackground(),
       webPreferences: {
         preload: join(ROOT, 'preload.cjs'), nodeIntegration: false, contextIsolation: true,
         sandbox: true, webSecurity: true, allowRunningInsecureContent: false,
@@ -52,7 +60,13 @@ else {
       const allowed = details.url.startsWith(pathToFileURL(join(ROOT,'ui')).href + '/') || details.url.startsWith('data:image/');
       callback({ cancel: !allowed });
     });
-    service.on('state', state => { if (window && !window.isDestroyed()) window.webContents.send('beauty:state',state); });
+    service.on('state', state => {
+      applyTheme(state.config.theme);
+      if (window && !window.isDestroyed()) window.webContents.send('beauty:state',state);
+    });
+    nativeTheme.on('updated', () => {
+      if (window && !window.isDestroyed()) window.setBackgroundColor(themeBackground());
+    });
     powerMonitor.on('suspend', () => { void service.lock(); });
     powerMonitor.on('lock-screen', () => { void service.lock(); });
     ipcMain.on('beauty:activity', event => {
