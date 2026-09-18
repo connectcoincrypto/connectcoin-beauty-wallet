@@ -9,9 +9,8 @@ import { networkParameters, normalizeMnemonic, validateMnemonic } from './crypto
 const derive = promisify(scrypt);
 const KDF = Object.freeze({ name: 'scrypt', N: 131072, r: 8, p: 1, keyLength: 32 });
 const LIMIT = 131072;
-// Stable authenticated file-format identifier, not UI branding. Changing this
-// would invalidate existing AES-GCM backups and break older wallet readers.
-const FORMAT = 'connectcoin-beauty-wallet';
+// Exclusive ConnectWallet format: no alternate identifiers or migration.
+const FORMAT = 'connectcoin-connect-wallet';
 const VERSION = 1;
 
 export function validatePassword(password) {

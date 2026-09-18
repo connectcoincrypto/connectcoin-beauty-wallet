@@ -52,7 +52,7 @@ npm run pack
 
 `build:claims` uses PyInstaller to include the Python runtime and verification dependencies. Packaged users do **not** need Python or a node. `npm run dist` produces an installer/package for the current platform: Windows NSIS, Linux AppImage or macOS DMG. Code signing/notarization requires the distributor's certificates; this repository does not claim its builds are signed. Generated installers are in `dist/` and are not committed.
 
-The Windows installer retains its original NSIS upgrade GUID even though the product name and app ID have changed. Keep this explicit `build.nsis.guid` stable so upgrades recognize an existing installation.
+Keep the Windows installer's explicit `build.nsis.guid` stable so upgrades recognize an existing ConnectWallet installation.
 
 ## RPC configuration
 
@@ -62,7 +62,7 @@ On first launch, a `config.json` is created alongside the encrypted wallet in th
 - Linux: `$XDG_CONFIG_HOME/ConnectWallet/` (normally `~/.config/ConnectWallet/`)
 - macOS: `~/Library/Application Support/ConnectWallet/`
 
-**Upgrading from Beauty Wallet:** ConnectWallet reuses an existing `ConnectCoin Beauty Wallet` data folder and its `wallet.beauty.json` in place, including saved settings and logs. It does not copy or re-encrypt your wallet just to rename it. Fresh profiles use `wallet.connectwallet.json`. If both old and new locations contain wallets, or both filenames exist in the selected folder, startup stops for you to resolve the conflict without overwriting either wallet. Keep an independent backup before moving wallet files manually.
+ConnectWallet uses only its own data folder and `wallet.connectwallet.json`. It does not search other application profiles, use alternate wallet filenames or automatically import or migrate existing data.
 
 The defaults are **`connectcoin4.com`, TCP port `48190`, testnet4**. Change hostname and port in Settings or edit the file while the app is closed. See [config.example.json](config.example.json).
 
@@ -93,7 +93,7 @@ The recovery phrase bypasses the local password: anyone with it controls the key
 
 **Use another wallet** lets you create or import another wallet without unlocking the current one. Both flows require an explicit acknowledgment. The active file stays untouched until a valid restoration completes or you verify the backup words for a newly generated wallet. Cancelling beforehand keeps the current wallet. On completion, the exact previous encrypted file is preserved under `wallet-backups/` in the data folder before the active wallet file is replaced. Creating another wallet does not transfer or recover the old funds. A backup in the same data folder does not protect against loss of the device; keep an independent offline backup too.
 
-Every encrypted-file backup, including these preserved copies, still needs its original password. To restore one, close the application and preserve any existing wallet elsewhere first. Place the backup at the profile's active wallet filename: `wallet.connectwallet.json` for fresh profiles, or `wallet.beauty.json` for a reused legacy wallet. Do not leave both filenames in the same profile. Alternatively, restore using the original recovery phrase. The encrypted file format is unchanged, so older encrypted backups remain readable.
+Every encrypted-file backup, including these preserved copies, still needs its original password. To restore a supported backup, close the application and preserve any existing wallet elsewhere first, then place the backup at `wallet.connectwallet.json` in the ConnectWallet data folder. Only encrypted files with the `connectcoin-connect-wallet` format identifier are supported. Earlier testnet file formats are not accepted or automatically converted, even if the file is renamed. Restore those wallets using their original BIP39 recovery phrase through **Forgot password?** or the initial restoration screen. Do not edit an encrypted file's format identifier: it is authenticated, so changing it invalidates the file. Existing files are not deleted automatically.
 
 Locking drops the decrypted session, invalidates payment reviews and stops claims. The default inactivity lock is 15 minutes, configurable from 1–60. OS lock/suspend also locks the application. **JavaScript cannot guarantee physical erasure of all string copies from memory**, and no software wallet protects against malware controlling your unlocked computer.
 

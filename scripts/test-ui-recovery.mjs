@@ -9,7 +9,7 @@ import path from 'node:path';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { GENESIS } from '../src/core/config.mjs';
-import { unlockVault } from '../src/core/vault.mjs';
+import { createVault, unlockVault } from '../src/core/vault.mjs';
 import { waitForUiCondition } from './ui-wait.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -156,9 +156,14 @@ async function createReplacement() {
 }
 
 try {
+  // Bootstrap only the original encrypted fixture directly. Restoring it here
+  // repeated the full 60-second RPC quota window before the actual recovery
+  // under test below. Keep real unlock, recovery discovery and rate limits.
+  await createVault(vaultFile, { name: 'Original isolated wallet', mnemonic, network: 'testnet4', passphrase: '',
+    receiveIndex: 0, changeIndex: 0, lastUsedReceive: -1, lastUsedChange: -1, needsRecovery: false }, oldPassword);
   await launch();
-  await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
-  await page.evaluate(data => window.connectwallet.invoke('restoreWallet', data), { name: 'Original isolated wallet', mnemonic, password: oldPassword });
+  await page.locator('#unlock-password').fill(oldPassword);
+  await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
   const originalAddress = (await ready()).wallet.address;
   await lock();
   await page.screenshot({ path: path.join(screenshots, 'locked-recovery-options.png') });
@@ -200,10 +205,13 @@ try {
   await unchanged(originalBytes);
 
   nextStage('recovery commits only after valid phrase, preserving encrypted archive');
+  const historyBeforeRecovery = requests.filter(method => method === 'getaddresshistory').length;
   await begin('recover');
   await fillRestore(mnemonic, newPassword);
   await page.getByRole('button', { name: 'Restore wallet and reset password' }).click();
   assert.equal((await ready()).wallet.address, originalAddress);
+  assert.ok(requests.filter(method => method === 'getaddresshistory').length - historyBeforeRecovery >= 80,
+    'Recovery must still discover both 20-address gaps and refresh the complete lookahead through real RPC.');
   assert.equal(await page.locator('#restore-phrase, .seed-word').count(), 0);
   await lock();
   const firstBackups = await archives();

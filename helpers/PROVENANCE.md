@@ -52,8 +52,11 @@ captures whose hash misses. Already in-flight captures may still finish. A
 bounded 1,024-entry counter cache never evicts active/queued bounties; the main
 process supplies its retained uint64 counter on every request. No private-network
 or unpinned-root bypass is available. Automatic Claims remain opt-in. Individual
-cancellation closes only that attempt's socket; wallet lock/stop terminates the
-entire helper. OS DNS calls cannot be interrupted by Python, so process termination
+cancellation closes only that attempt's socket. Cancellable TLS receives also
+check cancellation using receive polls of up to 100 ms, including partial record headers and
+bodies: cross-thread socket closure alone does not reliably wake macOS receives.
+These polls share the original absolute handshake deadline; they do not extend
+it. Wallet lock/stop terminates the entire helper. OS DNS calls cannot be interrupted by Python, so process termination
 remains the hard shutdown bound for a stuck resolver. Input/output frames are
 limited to 16/160 KiB and concurrent output is serialized.
 

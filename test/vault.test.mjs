@@ -13,6 +13,7 @@ test('wallet password is mandatory and unrelated to mnemonic seed passphrase', (
 });
 test('scrypt/AES-GCM roundtrip and authenticated corruption/wrong password fail closed', async () => {
   const envelope = await encryptVault(payload, password);
+  assert.equal(envelope.format, 'connectcoin-connect-wallet');
   assert.equal(envelope.kdf.N, 131072);
   assert.equal(envelope.cipher, 'aes-256-gcm');
   assert.equal(JSON.stringify(envelope).includes('abandon'), false);
@@ -21,6 +22,9 @@ test('scrypt/AES-GCM roundtrip and authenticated corruption/wrong password fail 
   const changed = { ...envelope, tag: `${envelope.tag[0] === '0' ? '1' : '0'}${envelope.tag.slice(1)}` };
   await assert.rejects(decryptVault(changed, password), /Cannot unlock/);
   await assert.rejects(decryptVault({ ...envelope, version: 2 }, password), /Unsupported/);
+  for (const format of ['unrecognized-wallet', 'connectwallet', '', null, undefined]) {
+    await assert.rejects(decryptVault({ ...envelope, format }, password), /Unsupported/);
+  }
   await assert.rejects(decryptVault({ ...envelope, kdf: { ...envelope.kdf, N: 2 ** 30 } }, password), /Unsupported/);
   await assert.rejects(decryptVault({ ...envelope, salt: '00' }, password), /Invalid/);
 });

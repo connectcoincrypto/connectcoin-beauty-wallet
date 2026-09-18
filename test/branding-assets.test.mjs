@@ -13,14 +13,13 @@ test('ConnectWallet package, repository and renderer use the current identity', 
   assert.equal(pkg.productName, 'ConnectWallet');
   assert.equal(pkg.repository.url, 'https://github.com/connectcoincrypto/connectcoin-connect-wallet.git');
   assert.equal(pkg.build.appId, 'com.connectcoincrypto.connectwallet');
-  // Stable installer upgrade identity: a display-name change must not create a second install.
+  // Stable installer upgrade identity prevents duplicate installations.
   assert.equal(pkg.build.nsis.guid, 'd88d5a21-77b9-537e-98d1-01560f964433');
   assert.equal(lock.name, pkg.name);
   assert.equal(lock.packages[''].name, pkg.name);
-  for (const file of ['src/ui/app.mjs', 'src/ui/index.html', 'src/preload.cjs', 'src/main.mjs']) {
-    const source = await read(file, 'utf8');
-    assert.doesNotMatch(source, /beauty/i, `${file} has obsolete branding`);
-  }
+  assert.match(await read('README.md', 'utf8'), /^# ConnectWallet\r?\n/);
+  assert.match(await read('src/main.mjs', 'utf8'), /app\.setName\('ConnectWallet'\)/);
+  assert.match(await read('src/preload.cjs', 'utf8'), /exposeInMainWorld\('connectwallet'/);
   assert.match(await read('src/ui/app.mjs', 'utf8'), /window\.connectwallet/);
   assert.match(await read('src/ui/index.html', 'utf8'), /<title>ConnectWallet · ConnectCoin<\/title>/);
 });

@@ -52,6 +52,10 @@ TLS_1_2 = 0x0303
 TLS_1_3 = 0x0304
 MAX_TLS_CIPHERTEXT = (1 << 14) + 256
 MAX_CAPTURED_HANDSHAKE = 64 * 1024
+# Closing a socket from another thread does not reliably wake an in-progress
+# select/recv on every OS. Poll only cancellable receives; the handshake still
+# has one absolute deadline, not a fresh timeout for each poll or TLS record.
+CANCEL_POLL_SECONDS = 0.1
 
 
 class TLSGenerationError(P2CError):
@@ -285,19 +289,40 @@ def _remaining_timeout(deadline: float) -> float:
     return remaining
 
 
-def _recv_exact(connection: socket.socket, size: int, deadline: float) -> bytes:
+def _recv_exact(
+    connection: socket.socket,
+    size: int,
+    deadline: float,
+    control: CaptureControl | None = None,
+) -> bytes:
     result = bytearray()
     while len(result) < size:
-        connection.settimeout(_remaining_timeout(deadline))
-        chunk = connection.recv(size - len(result))
+        if control is not None and control.cancelled():
+            raise CaptureCancelled("TLS capture cancelled")
+        remaining = _remaining_timeout(deadline)
+        try:
+            connection.settimeout(min(remaining, CANCEL_POLL_SECONDS) if control is not None else remaining)
+            chunk = connection.recv(size - len(result))
+        except OSError as error:
+            if control is not None and control.cancelled():
+                raise CaptureCancelled("TLS capture cancelled") from error
+            if control is not None and isinstance(error, TimeoutError):
+                continue
+            raise
+        if control is not None and control.cancelled():
+            raise CaptureCancelled("TLS capture cancelled")
         if not chunk:
             raise TLSGenerationError("TLS peer closed the connection during the handshake")
         result.extend(chunk)
     return bytes(result)
 
 
-def _recv_record(connection: socket.socket, deadline: float) -> tuple[int, bytes, bytes]:
-    header = _recv_exact(connection, 5, deadline)
+def _recv_record(
+    connection: socket.socket,
+    deadline: float,
+    control: CaptureControl | None = None,
+) -> tuple[int, bytes, bytes]:
+    header = _recv_exact(connection, 5, deadline, control)
     content_type = header[0]
     version = int.from_bytes(header[1:3], "big")
     size = int.from_bytes(header[3:5], "big")
@@ -305,7 +330,7 @@ def _recv_record(connection: socket.socket, deadline: float) -> tuple[int, bytes
         raise TLSGenerationError("TLS peer used an invalid record version")
     if size > MAX_TLS_CIPHERTEXT:
         raise TLSGenerationError("TLS record exceeds the TLS 1.3 ciphertext limit")
-    return content_type, header, _recv_exact(connection, size, deadline)
+    return content_type, header, _recv_exact(connection, size, deadline, control)
 
 
 def _pop_handshake(buffer: bytearray) -> bytes | None:
@@ -463,7 +488,7 @@ def capture_tls13_proof(
         plaintext_handshake = bytearray()
         server_hello: bytes | None = None
         while server_hello is None:
-            content_type, _, fragment = _recv_record(connection, deadline)
+            content_type, _, fragment = _recv_record(connection, deadline, control)
             if content_type == CONTENT_CHANGE_CIPHER_SPEC and fragment == b"\x01":
                 continue
             if content_type == CONTENT_ALERT:
@@ -490,7 +515,7 @@ def capture_tls13_proof(
         captured: list[bytes] = []
         sequence = 0
         while len(captured) < len(expected_messages):
-            content_type, header, fragment = _recv_record(connection, deadline)
+            content_type, header, fragment = _recv_record(connection, deadline, control)
             if content_type == CONTENT_CHANGE_CIPHER_SPEC and fragment == b"\x01":
                 continue
             if content_type == CONTENT_ALERT:

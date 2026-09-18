@@ -29,8 +29,7 @@ try {
 app.setName('ConnectWallet');
 if (profileError) {
   void app.whenReady().then(() => {
-    dialog.showErrorBox('ConnectWallet could not start', profileError.code === 'WALLET_PROFILE_CONFLICT'
-      ? profileError.message : 'The wallet data folder could not be read safely. Check its permissions and keep any existing wallet files intact.');
+    dialog.showErrorBox('ConnectWallet could not start', 'The wallet data folder could not be read safely. Check its permissions and keep any existing wallet files intact.');
     app.quit();
   });
 } else if (!app.requestSingleInstanceLock()) app.quit();
@@ -135,8 +134,7 @@ else {
     window.once('ready-to-show', () => { window.show(); });
     await window.loadFile(INDEX);
   } catch (error) {
-    dialog.showErrorBox('ConnectWallet could not start', error.code === 'WALLET_PROFILE_CONFLICT'
-      ? error.message : 'Check the configuration file in your ConnectWallet data folder. The wallet has not sent any transaction.');
+    dialog.showErrorBox('ConnectWallet could not start', 'Check the configuration file in your ConnectWallet data folder. The wallet has not sent any transaction.');
     app.quit();
   }
   });
