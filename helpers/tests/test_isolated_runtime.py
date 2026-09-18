@@ -1,0 +1,60 @@
+"""Exercise the real source entry point without inheriting the test sys.path."""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+BRIDGE = Path(__file__).resolve().parents[1] / "claims_bridge.py"
+
+
+class IsolatedRuntimeTests(unittest.TestCase):
+    def invoke(self, arguments, frames=""):
+        with tempfile.TemporaryDirectory(prefix="connectwallet-isolation-") as directory:
+            # Neither cwd, PYTHONPATH, nor user-site hooks may supply helper
+            # modules. Poison files make loss of -I or a cwd import observable.
+            poison = Path(directory)
+            for name in ("claims_service.py", "sitecustomize.py", "usercustomize.py"):
+                (poison / name).write_text("raise RuntimeError('untrusted import')\n", encoding="utf-8")
+            package = poison / "connectcoin_p2c_tools"
+            package.mkdir()
+            (package / "__init__.py").write_text("raise RuntimeError('untrusted vendor')\n", encoding="utf-8")
+            env = {**os.environ, "PYTHONPATH": directory, "PYTHONUSERBASE": directory}
+            return subprocess.run(
+                [sys.executable, "-I", str(BRIDGE), *arguments],
+                input=frames, cwd=directory, env=env, text=True,
+                capture_output=True, timeout=20, check=False,
+            )
+
+    def test_service_starts_and_shuts_down_from_untrusted_directory(self):
+        frames = "\n".join(json.dumps(frame) for frame in (
+            {"type": "start", "protocol": 3, "options": {"connectionsPerSecond": 100, "concurrency": 100}},
+            {"type": "shutdown"},
+        )) + "\n"
+        result = self.invoke(["--service"], frames)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual([json.loads(line) for line in result.stdout.splitlines()],
+                         [{"type": "ready", "protocol": 3, "roots": 1}])
+
+    def test_isolated_self_test_uses_trusted_dependencies(self):
+        result = self.invoke(["--self-test"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout), {"type": "ready", "protocol": 3, "roots": 1})
+
+    def test_service_rejects_wrong_protocol_without_starting_work(self):
+        result = self.invoke(["--service"], '{"type":"start","protocol":2,"options":{}}\n')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        frames = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["type"], "error")
+
+
+if __name__ == "__main__":
+    unittest.main()

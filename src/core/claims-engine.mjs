@@ -47,7 +47,7 @@ export class ClaimsEngine {
     if (![prepare, submit, isUnlocked, onState, randomIndex, getNetReward].every(fn => typeof fn === 'function')) throw new Error('Claim callbacks are required');
     if (!Number.isInteger(maxQueue) || maxQueue < 1 || maxQueue > 20000 || !Number.isInteger(retryDelayMs) || retryDelayMs < 1 || retryDelayMs > 300000) throw new Error('Invalid claim queue limits');
     Object.assign(this, { prepare, submit, isUnlocked, onState, onDiagnostic, randomIndex, getNetReward, getValidationTime, maxQueue, retryDelayMs });
-    this.poolFactory = poolFactory ?? (generateProof ? () => injectedPool(generateProof) : () => new ConnectionPool({ resourcesPath, onDiagnostic }));
+    this.poolFactory = poolFactory ?? (generateProof ? () => injectedPool(generateProof) : ({ onFailure }) => new ConnectionPool({ resourcesPath, onDiagnostic, onFailure }));
     this.options = validateConnectionOptions(options);
     this.queue = new Map(); this.completed = new Set(); this.factors = new Map(); this.successCounts = new Map();
     this.proposals = new Map(); this.pendingProofs = new Map(); this.submitting = new Set();
@@ -320,7 +320,9 @@ export class ClaimsEngine {
     if (!this.isUnlocked()) { void this.stop('locked'); this.notify({ status: 'locked' }); return; }
     clearTimeout(this.timer); this.timer = null;
     const generation = this.generation;
-    const operation = Promise.resolve().then(() => this.pump(generation)).catch(error => this.fatal(error));
+    const operation = Promise.resolve().then(() => this.pump(generation)).catch(error => {
+      if (generation === this.generation || error.unknownOutcome) this.fatal(error);
+    });
     this.coordinator = operation.finally(() => {
       this.coordinator = null;
       if (this.wakeRequested) { this.wakeRequested = false; this.kick(); }
@@ -329,7 +331,14 @@ export class ClaimsEngine {
   async pump(generation) {
     if (!this.enabled || this.paused || generation !== this.generation) return;
     if (!this.pool) {
-      this.pool = this.poolFactory(); this.poolReady = this.pool.start(this.options);
+      let pool;
+      const onFailure = error => queueMicrotask(() => {
+        // A helper can die while idle, when no request promise will reject.
+        // Old helpers must not stop a restarted/resumed engine generation.
+        if (this.pool === pool && generation === this.generation && this.enabled && !this.paused) this.fatal(error);
+      });
+      pool = this.poolFactory({ onFailure }); this.pool = pool;
+      this.poolReady = pool.start(this.options);
       await this.poolReady;
     } else await this.poolReady;
     if (!this.enabled || this.paused || generation !== this.generation) return;
@@ -550,7 +559,8 @@ export class ClaimsEngine {
       // or queue time. Aggregated progress counts every success, even if sampled.
       this.sampleDiagnostic('claim.succeeded', { stage: 'submit', claimId: job.diagnosticId, completed: this.state.completed + 1,
         durationMs: Math.round(performance.now() - started), attempts: 1 });
-      this.notify({ status: this.enabled ? 'claimed' : 'off', completed: this.state.completed + 1, lastError: null,
+      this.notify({ status: this.enabled ? 'claimed' : 'off', completed: this.state.completed + 1,
+        ...(this.enabled && generation === this.generation ? { lastError: null } : {}),
         lastClaim: typeof receipt === 'string' ? receipt : receipt?.txid ?? pending.context.txid });
     } catch (error) {
       this.finishOperation(operation, error.name === 'AbortError' && !error.unknownOutcome ? 'cancelled' : 'failed');
@@ -574,9 +584,15 @@ export class ClaimsEngine {
     if (backoff) { job.failures = Math.min(job.failures + 1, 8); job.due = Date.now() + Math.min(this.retryDelayMs * 2 ** (job.failures - 1), 300000); }
     this.sampleDiagnostic('claim.failed', { stage, claimId: job.diagnosticId, error, failures: job.failures,
       retryDelayMs: backoff ? Math.max(0, job.due - Date.now()) : 1000, ...details });
+    // Other in-flight jobs can fail during teardown. Keep their diagnostics,
+    // but do not replace the fatal/unknown-broadcast warning with a retry alert.
+    if (this.haltReason === 'fatal') return;
     this.notify({ status: this.enabled ? 'retrying' : 'off', lastError: String(error.message ?? error).slice(0, 500), lastErrorTransient: true, lastErrorDiagnostic: stage === 'submit' && isKnownClaimRejection(error) });
   }
   fatal(error) {
+    // Cancellation can reveal that an in-flight broadcast has an unknown
+    // outcome. That warning must supersede a helper failure, even during drain.
+    if (!this.enabled && this.haltReason === 'fatal' && !error.unknownOutcome) return;
     if (error.name === 'AbortError' && !error.unknownOutcome && (!this.enabled || this.paused)) return;
     this.enabled = false; // Close the gate before diagnostics or any other callback.
     // Fatal/unknown-broadcast events bypass sampling. Their original safe error

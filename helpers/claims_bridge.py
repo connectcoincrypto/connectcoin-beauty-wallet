@@ -9,6 +9,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+# Isolated Python (-I) deliberately omits the script directory. Restore only
+# this trusted, absolute directory so --service can import its sibling module;
+# never restore the working directory or caller-supplied PYTHONPATH.
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "vendor"))
 
 from connectcoin_p2c_tools.envelope import ConnectionProof  # noqa: E402

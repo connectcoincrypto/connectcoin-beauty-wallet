@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { getClaimsHelper, validateClaimContext } from './claims.mjs';
+import { diagnosticProcessExit } from './diagnostics.mjs';
 
 export const CONNECTION_DEFAULTS = Object.freeze({ connectionsPerSecond: 100, concurrency: 100 });
 export function validateConnectionOptions(input = {}) {
@@ -17,27 +18,29 @@ function counter(value) {
 
 /** One process for the entire run. Requests contain public claim contexts only. */
 export class ConnectionPool {
-  constructor({ helper, resourcesPath, basePath, spawnProcess = spawn, onDiagnostic = () => {} } = {}) {
-    Object.assign(this, { helper, resourcesPath, basePath, spawnProcess, onDiagnostic });
+  constructor({ helper, resourcesPath, basePath, spawnProcess = spawn, onDiagnostic = () => {}, onFailure = () => {} } = {}) {
+    Object.assign(this, { helper, resourcesPath, basePath, spawnProcess, onDiagnostic, onFailure });
     this.pacesStarts = true; // Protocol 3 enforces one global clock at socket start.
     this.requests = new Map(); this.sequence = 0; this.closing = false;
   }
   async start(options) {
+    if (this.closing) throw claimAborted();
     if (this.ready) return this.ready;
     this.options = validateConnectionOptions(options);
     const runtime = this.helper ?? getClaimsHelper({ basePath: this.basePath, resourcesPath: this.resourcesPath });
     if (!runtime) throw new Error('Automatic Claims helper is not installed. Run npm run build:claims.');
     this.ready = new Promise((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject; });
     this.closed = new Promise(resolve => { this.closedResolve = resolve; });
+    this.startedAt = performance.now();
     const allowed = new Set(['path', 'systemroot', 'systemdrive', 'windir', 'temp', 'tmp', 'tmpdir', 'home', 'userprofile', 'localappdata', 'appdata', 'user', 'username', 'lang', 'lc_all', 'tz']);
     const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.has(key.toLowerCase())));
     try {
       this.child = this.spawnProcess(runtime.command, [...runtime.args ?? [], '--service'], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' } });
       this.buffer = ''; this.stderrBytes = 0;
-      this.child.once('error', error => { this.fail(new Error(`Claims helper could not start: ${error.message}`)); this.closedResolve(); });
+      this.child.once('error', error => { this.fail(new Error('Claims helper could not start', { cause: error })); this.closedResolve(); });
       this.child.stdin.on('error', error => { if (!this.closing) this.fail(new Error(`Claims helper input failed: ${error.message}`)); });
       this.child.stdout.on('data', data => {
-        if (this.failure) return;
+        if (this.failure || this.closing || this.processClosed) return;
         try {
           this.buffer += data.toString('utf8');
           let end;
@@ -49,10 +52,14 @@ export class ConnectionPool {
           if (this.buffer.length > 160 * 1024) throw new Error('Claims helper frame limit exceeded');
         } catch (error) { this.fail(error); }
       });
-      this.child.stderr.on('data', data => { this.stderrBytes += data.length; if (this.stderrBytes > 8192) this.fail(new Error('Claims helper diagnostic limit exceeded')); });
-      this.child.once('close', () => {
+      this.child.stderr.on('data', data => {
+        this.stderrBytes = Math.min(1073741824, this.stderrBytes + data.length);
+        if (this.stderrBytes > 8192) this.fail(new Error('Claims helper diagnostic limit exceeded'));
+      });
+      this.child.once('close', (code, signal) => {
+        this.processClosed = true;
         clearTimeout(this.startTimer); clearTimeout(this.killTimer);
-        if (!this.closing) this.fail(new Error('Persistent claims helper closed unexpectedly'));
+        if (!this.closing) this.fail(new Error('Persistent claims helper closed unexpectedly'), diagnosticProcessExit(code, signal));
         else for (const request of [...this.requests.values()]) this.finish(request, claimAborted());
         this.readyReject(claimAborted()); this.closedResolve();
       });
@@ -135,19 +142,26 @@ export class ConnectionPool {
     clearTimeout(request.timer); request.signal?.removeEventListener('abort', request.abort);
     if (error) request.reject(error); else request.resolve(result);
   }
-  fail(error) {
-    if (this.failure) return;
+  fail(error, exit = {}) {
+    if (this.failure || this.closing) return;
     this.failure = Object.assign(error, { helperFatal: true });
     clearTimeout(this.startTimer); this.readyReject?.(this.failure);
     for (const request of [...this.requests.values()]) this.finish(request, this.failure);
-    if (this.child && !this.child.killed) this.child.kill('SIGKILL');
-    try { Promise.resolve(this.onDiagnostic('helper.failed', { stage: 'proof', error: this.failure })).catch(() => {}); } catch { /* No effect on cancellation. */ }
+    if (this.child && !this.processClosed && !this.child.killed) this.child.kill('SIGKILL');
+    try {
+      Promise.resolve(this.onDiagnostic('helper.failed', { stage: 'proof', error: this.failure,
+        helperReady: this.started === true, durationMs: Math.min(86400000, Math.max(0, performance.now() - this.startedAt)),
+        stderrBytes: this.stderrBytes ?? 0, ...exit })).catch(() => {});
+    } catch { /* No effect on cancellation. */ }
+    // A ready helper may die while no request is in flight. Control flow must
+    // not depend on a diagnostic consumer being installed or on another claim.
+    try { Promise.resolve(this.onFailure(this.failure)).catch(() => {}); } catch { /* Cleanup still completes. */ }
   }
   async close() {
     if (this.closing) return this.closed;
     this.closing = true;
     clearTimeout(this.startTimer);
-    if (!this.child) { this.closedResolve?.(); return; }
+    if (!this.child || this.processClosed) { this.closedResolve?.(); return; }
     try { this.send({ type: 'shutdown' }); this.child.stdin.end(); } catch { this.child.kill('SIGKILL'); }
     this.killTimer = setTimeout(() => { if (!this.child.killed) this.child.kill('SIGKILL'); }, 2000);
     await this.closed;

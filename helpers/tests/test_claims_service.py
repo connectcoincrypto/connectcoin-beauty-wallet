@@ -387,6 +387,13 @@ class ServiceTests(unittest.TestCase):
                 return fake_capture(*args, **kwargs)
             h.capture.side_effect = recorded
             for identifier in range(2, 1102):
+                # This checks executor longevity and bounded caches, not wall
+                # clock rate accuracy. Expire the previous synthetic slot so
+                # OS sleep granularity cannot add 4-16 seconds to 1,100 mocks.
+                # Keep the real start hook (including budget/cancel checks);
+                # the dedicated cross-domain rate test still uses real time.
+                with h.service.condition:
+                    h.service.next_start = 0
                 h.attempt(identifier, bounty=identifier)
                 self.assertTrue(h.wait("attempt", identifier)["captured"])
             self.assertIs(h.service.executor, executor)

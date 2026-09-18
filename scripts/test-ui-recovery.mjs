@@ -57,14 +57,26 @@ delete env.ELECTRON_RUN_AS_NODE;
 let application;
 let page;
 let stage = 'launch isolated profile';
+let stageStarted = performance.now();
 let passed = false;
 let createdWords = [];
 const errors = [];
+const lifecycle = [];
+
+function nextStage(value) {
+  // Stage labels are fixed below; never log page text, wallet data or inputs.
+  console.log(`Recovery UI stage completed: ${stage} (${Math.round(performance.now() - stageStarted)} ms).`);
+  stage = value;
+  stageStarted = performance.now();
+}
 
 async function launch() {
   application = await electron.launch({ executablePath: createRequire(import.meta.url)('electron'), args: [root], env, colorScheme: null, timeout: 30000 });
+  application.on('close', () => lifecycle.push({ event: 'application.closed', elapsedMs: Math.round(performance.now() - stageStarted) }));
   page = await application.firstWindow();
   page.setDefaultTimeout(15000);
+  page.on('close', () => lifecycle.push({ event: 'page.closed', elapsedMs: Math.round(performance.now() - stageStarted) }));
+  page.on('crash', () => lifecycle.push({ event: 'page.crashed', elapsedMs: Math.round(performance.now() - stageStarted) }));
   page.on('pageerror', error => errors.push(error.name));
 }
 async function ready() {
@@ -153,7 +165,7 @@ try {
   const originalBytes = await readFile(vaultFile);
   assert.equal((await archives()).length, 0);
 
-  stage = 'locked alternatives and cancellable warning';
+  nextStage('locked alternatives and cancellable warning');
   for (const label of ['Forgot password?', 'Use another wallet']) {
     await page.getByRole('button', { name: label, exact: true }).click();
     await page.locator('dialog[open] #replacement-ack').waitFor();
@@ -165,7 +177,7 @@ try {
     await unchanged(originalBytes);
   }
 
-  stage = 'acknowledgement, invalid input and cancellation preserve existing wallet';
+  nextStage('acknowledgement, invalid input and cancellation preserve existing wallet');
   await begin('recover', { testAcknowledgement: true });
   await page.screenshot({ path: path.join(screenshots, 'recovery-empty-form.png'), fullPage: true });
   await unchanged(originalBytes);
@@ -187,7 +199,7 @@ try {
   await cancelReplacement();
   await unchanged(originalBytes);
 
-  stage = 'recovery commits only after valid phrase, preserving encrypted archive';
+  nextStage('recovery commits only after valid phrase, preserving encrypted archive');
   await begin('recover');
   await fillRestore(mnemonic, newPassword);
   await page.getByRole('button', { name: 'Restore wallet and reset password' }).click();
@@ -207,7 +219,7 @@ try {
   await lock();
   const recoveredBytes = await readFile(vaultFile);
 
-  stage = 'creation preview can be cancelled without replacing old wallet';
+  nextStage('creation preview can be cancelled without replacing old wallet');
   await createReplacement();
   await unchanged(recoveredBytes, 1);
   await page.locator('[data-action="cancel-setup"]').click();
@@ -218,7 +230,7 @@ try {
   await unchanged(recoveredBytes, 1);
   createdWords.fill(''); createdWords = [];
 
-  stage = 'new wallet requires verified seed and archives previous encrypted file';
+  nextStage('new wallet requires verified seed and archives previous encrypted file');
   await createReplacement();
   await unchanged(recoveredBytes, 1);
   await page.locator('#backup-ack').check();
@@ -242,7 +254,7 @@ try {
   assert.equal((await unlockVault(path.join(backupDirectory, nextBackupName), newPassword)).mnemonic, mnemonic);
   assert.equal((await unlockVault(vaultFile, createdPassword)).mnemonic, createdWords.join(' '));
 
-  stage = 'relaunch with new wallet and encrypted storage only';
+  nextStage('relaunch with new wallet and encrypted storage only');
   await application.close(); application = null;
   await launch();
   await page.locator('#unlock-password').waitFor();
@@ -260,12 +272,17 @@ try {
   assert.deepEqual(errors, []);
   assert.ok(requests.includes('getaddressbalance'));
   assert.ok(!requests.includes('sendrawtransaction'));
+  nextStage('finished');
   passed = true;
   console.log(`PASS: isolated Electron locked recovery/switch controls, acknowledgement gates, cancellation, invalid phrases/password confirmation, verified new seed, same-address password recovery, byte-exact encrypted archives, relaunch persistence and no broadcasts. Non-secret screenshots: ${screenshots}`);
 } catch (error) {
   // Never emit Playwright action dumps, secrets, page HTML or seed screenshots.
   const line = /test-ui-recovery\.mjs:(\d+):\d+/.exec(String(error.stack ?? ''))?.[1];
-  console.error(`Recovery UI test failed during ${stage} (${error.name ?? 'Error'}${line ? `, test line ${line}` : ''}). No recovery words were logged. Temporary profile preserved: ${profile}`);
+  console.error(`Recovery UI test failed during ${stage} after ${Math.round(performance.now() - stageStarted)} ms (${error.name ?? 'Error'}${line ? `, test line ${line}` : ''}). No recovery words were logged. Temporary profile preserved: ${profile}`);
+  // Only fixed categories and event timings, never Playwright's action dump.
+  const reason = /closed|destroyed/i.test(String(error.message)) ? 'window-or-process-closed'
+    : /timeout|timed out/i.test(String(error.message)) ? 'deadline-exceeded' : 'assertion-or-action-failure';
+  console.error(`Recovery UI failure metadata: ${JSON.stringify({ reason, lifecycle })}`);
   process.exitCode = 1;
 } finally {
   createdWords.fill(''); createdWords = [];

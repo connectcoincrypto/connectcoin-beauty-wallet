@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, readFile, readdir, rm, stat, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, isAbsolute, resolve, dirname, basename } from 'node:path';
-import { DiagnosticLog, diagnosticError } from '../src/core/diagnostics.mjs';
+import { DiagnosticLog, diagnosticError, diagnosticProcessExit } from '../src/core/diagnostics.mjs';
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'connectwallet-diagnostics-'));
@@ -154,6 +154,9 @@ test('known errors retain safe categories and codes without echoing messages', (
     [{ message: 'Bounty availability changed while preparing its claim.' }, 'bounty-unavailable'],
     [{ message: 'Automatic Claims helper is not installed. Run npm run setup:claims or use a packaged desktop release.' }, 'helper-missing'],
     [{ message: 'Claims helper could not start: arbitrary secret' }, 'helper-failed'],
+    [{ message: 'Persistent claims helper closed unexpectedly' }, 'helper-failed'],
+    [{ message: 'Incompatible claims helper; update or rebuild it' }, 'helper-failed'],
+    [{ message: 'arbitrary secret from helper', helperFatal: true }, 'helper-failed'],
     [{ message: 'Malformed claims helper response' }, 'helper-response'],
     [{ message: 'Claims helper ended without a verified proof' }, 'proof-failed'],
     [{ message: 'RPC server returned an invalid or oversized response.' }, 'invalid-response'],
@@ -182,6 +185,43 @@ test('wrapped errors use safe codes and at most one cause without retaining exce
   assert.equal(diagnosticError({ cause: { cause: { code: -32020 } } }).category, 'unknown');
   const cycle = {}; cycle.cause = cycle;
   assert.equal(diagnosticError(cycle).category, 'unknown');
+});
+
+test('helper exit metadata supports unsigned Windows status and only fixed signal names', async t => {
+  const directory = await fixture(t);
+  const log = new DiagnosticLog({ directory });
+  for (const exitCode of [0, 1, -1073741819, 0xc0000005, 0xffffffff]) {
+    log.record('helper.failed', { ...diagnosticProcessExit(exitCode, null), helperReady: false, stderrBytes: 27,
+      error: new Error('Persistent claims helper closed unexpectedly') });
+  }
+  log.record('helper.failed', { ...diagnosticProcessExit(null, 'SIGTERM'), helperReady: true });
+  await log.flush();
+  const stored = await rows(log.snapshot().file);
+  assert.deepEqual(stored.slice(0, 5).map(row => row.details.exitCode), [0, 1, -1073741819, 0xc0000005, 0xffffffff]);
+  assert.ok(stored.slice(0, 5).every(row => row.details.helperReady === false && row.details.error.category === 'helper-failed'));
+  assert.deepEqual(stored[5].details, { signal: 'SIGTERM', helperReady: true });
+  assert.deepEqual(diagnosticProcessExit(0xffffffff + 1, 'private-signal'), {});
+  assert.deepEqual(diagnosticProcessExit(-2147483649, 'sigterm'), {});
+  assert.deepEqual(diagnosticProcessExit(1.5, null), {});
+});
+
+test('forged helper status fields cannot escape strict diagnostic metadata allowlists', async t => {
+  const directory = await fixture(t);
+  const log = new DiagnosticLog({ directory });
+  const privateText = 'private-profile-path-and-stderr';
+  log.record('helper.failed', { exitCode: 0xffffffff + 1, helperReady: privateText, signal: privateText,
+    stderrBytes: 1073741825, stderr: privateText, argv: [privateText], profile: privateText,
+    error: { message: privateText, signal: privateText, exitCode: privateText, helperReady: privateText } });
+  let getters = 0;
+  log.record('helper.failed', Object.defineProperties({}, Object.fromEntries(['exitCode', 'signal', 'helperReady', 'stderrBytes'].map(key => [key, {
+    get() { getters++; return privateText; },
+  }]))));
+  await log.flush();
+  assert.equal(getters, 0);
+  const stored = await rows(log.snapshot().file);
+  assert.deepEqual(stored[0].details, { error: diagnosticError({}) });
+  assert.deepEqual(stored[1].details, {});
+  assert.equal((await readFile(log.snapshot().file, 'utf8')).includes(privateText), false);
 });
 
 test('prototype data, getters, coercion hooks and throwing proxies cannot enter logs', async t => {

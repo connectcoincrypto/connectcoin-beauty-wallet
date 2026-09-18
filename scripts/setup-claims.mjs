@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ConnectionPool } from '../src/core/claim-pool.mjs';
 
 const base = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
@@ -25,7 +26,13 @@ try { await access(python); } catch {
 }
 await run(python, ['-c', 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ is required"']);
 await run(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '-r', resolve(base, 'helpers', build ? 'requirements-build.txt' : 'requirements.txt')]);
-await run(python, [resolve(base, 'helpers/claims_bridge.py'), '--self-test']);
+await run(python, ['-I', resolve(base, 'helpers/claims_bridge.py'), '--self-test']);
+// Force the source runtime even if a previously built native helper exists.
+// This is the wallet's actual isolated launch/protocol, with no network or keys.
+const sourcePool = new ConnectionPool({ helper: { command: python, args: ['-I', resolve(base, 'helpers/claims_bridge.py')] } });
+try { await sourcePool.start({}); }
+finally { await sourcePool.close(); }
+console.log('Isolated source protocol-3 startup and shutdown verified.');
 await run(python, ['-m', 'unittest', 'discover', '-s', resolve(base, 'helpers/tests'), '-v']);
 if (build) {
   await run(python, [resolve(base, 'helpers/collect_licenses.py')]);

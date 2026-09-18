@@ -11,6 +11,12 @@ const EVENTS = new Set([
 const STAGES = new Set(['prepare', 'dns', 'proof', 'submit', 'refresh', 'discovery', 'connect', 'request', 'stream', 'lifecycle']);
 const REASONS = new Set(['stop', 'locked', 'suspend', 'clear', 'unavailable', 'window-exit', 'sibling-proof', 'fatal', 'other']);
 const DURATION_SCOPES = new Set(['stage', 'run']);
+const PROCESS_SIGNALS = new Set([
+  'SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGIOT', 'SIGBUS', 'SIGFPE',
+  'SIGKILL', 'SIGUSR1', 'SIGSEGV', 'SIGUSR2', 'SIGPIPE', 'SIGALRM', 'SIGTERM', 'SIGSTKFLT',
+  'SIGCHLD', 'SIGCONT', 'SIGSTOP', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU', 'SIGURG', 'SIGXCPU',
+  'SIGXFSZ', 'SIGVTALRM', 'SIGPROF', 'SIGWINCH', 'SIGIO', 'SIGPOLL', 'SIGPWR', 'SIGSYS', 'SIGBREAK',
+]);
 const METHODS = new Set([
   'getchaintip', 'getrecentblockhashes', 'getblockbounties', 'getaddressbalance',
   'getaddresshistory', 'getaddressutxos', 'gettransaction', 'sendrawtransaction',
@@ -55,6 +61,14 @@ function own(value, key) {
 }
 function numericCode(value) { return Number.isInteger(value) && value >= -2147483648 && value <= 2147483647; }
 
+/** OS process status only: Windows may expose NTSTATUS as an unsigned DWORD. */
+export function diagnosticProcessExit(exitCode, signal) {
+  return {
+    ...(Number.isInteger(exitCode) && exitCode >= -2147483648 && exitCode <= 0xffffffff ? { exitCode } : {}),
+    ...(PROCESS_SIGNALS.has(signal) ? { signal } : {}),
+  };
+}
+
 /** Canonical descriptions only: arbitrary peer/helper exception text never leaves this function. */
 export function diagnosticError(error) { return describeError(error, true); }
 function describeError(error, includeCause) {
@@ -91,7 +105,7 @@ function describeError(error, includeCause) {
   else if (/index.{0,40}not ready|RPC request failed\. Not ready/i.test(message)) category = 'index-not-ready';
   else if (/bounty.{0,60}(?:no longer|unavailable|availability changed)|Bounty availability changed/i.test(message)) category = 'bounty-unavailable';
   else if (/node rejected (?:this claim|the transaction)/i.test(message)) category = 'node-rejected';
-  else if (/helper (?:could not start|input failed)/i.test(message)) category = 'helper-failed';
+  else if (/helper (?:could not start|input failed|closed unexpectedly|failed)|Incompatible claims helper/i.test(message)) category = 'helper-failed';
   else if (/Malformed claims helper|Unknown claims helper|Invalid helper progress|Unexpected output after claims proof/i.test(message)) category = 'helper-response';
   else if (/TLS proof|without a verified proof|Invalid proof encoding|Proof does not match|proof generation failed|^TLS capture or proof validation failed$/i.test(message)) category = 'proof-failed';
   else if (/resource limit|(?:output|frame|diagnostic|safety|buffer) limit|capacity reached/i.test(message)) category = 'resource-limit';
@@ -99,6 +113,7 @@ function describeError(error, includeCause) {
   else if (/RPC connection (?:is closed|closed|changed)|RPC client (?:is closed|closed)|Connection to the RPC server was lost|Cannot connect to RPC/i.test(message)) category = 'network';
   else if (/snapshot.{0,40}(?:coherent|incomplete)|bounty window is changing|journal requested a new snapshot/i.test(message)) category = 'snapshot-stale';
   else if (/(?:Invalid|Incomplete|Unexpected|Duplicate).{0,45}(?:RPC|bounty|snapshot|stream|transaction)|RPC (?:server )?returned|Bounty stream was incomplete|complete recent-block window/i.test(message)) category = 'invalid-response';
+  else if (own(error, 'helperFatal') === true) category = 'helper-failed';
   const result = category === 'unknown' && cause !== undefined ? describeError(cause, false) : { category, message: MESSAGES[category] };
   if (code !== undefined) result.code = code;
   if (numericCode(nodeCode)) result.nodeCode = nodeCode;
@@ -109,7 +124,7 @@ const NUMBERS = Object.freeze({
   claimId: [0, Number.MAX_SAFE_INTEGER], attempts: [0, 1000000000], queued: [0, 1000000000],
   completed: [0, 1000000000], failures: [0, 1000000000], retryDelayMs: [0, 86400000],
   durationMs: [0, 86400000], height: [0, 0xffffffff], bytes: [0, 1073741824],
-  stderrBytes: [0, 1073741824], exitCode: [-2147483648, 2147483647],
+  stderrBytes: [0, 1073741824], exitCode: [-2147483648, 0xffffffff],
   runId: [0, Number.MAX_SAFE_INTEGER], operationsStarted: [0, 1000000000], operationsCompleted: [0, 1000000000],
   operationsFailed: [0, 1000000000], operationsCancelled: [0, 1000000000], captures: [0, 1000000000], suppressedEvents: [0, 1000000000],
   prepareActive: [0, 4], dnsActive: [0, 2], captureActive: [0, 256], submitActive: [0, 4],
@@ -126,11 +141,13 @@ function sanitize(details) {
   const reason = own(details, 'reason'), durationScope = own(details, 'durationScope');
   if (REASONS.has(reason)) clean.reason = reason;
   if (DURATION_SCOPES.has(durationScope)) clean.durationScope = durationScope;
+  const signal = own(details, 'signal');
+  if (PROCESS_SIGNALS.has(signal)) clean.signal = signal;
   for (const [key, [minimum, maximum]] of Object.entries(NUMBERS)) {
     const value = own(details, key);
     if (Number.isFinite(value) && value >= minimum && value <= maximum && (key === 'durationMs' || Number.isSafeInteger(value))) clean[key] = value;
   }
-  for (const key of ['enabled', 'paused', 'unknownOutcome']) {
+  for (const key of ['enabled', 'paused', 'unknownOutcome', 'helperReady']) {
     const value = own(details, key);
     if (typeof value === 'boolean') clean[key] = value;
   }
