@@ -10,10 +10,10 @@ import { fileURLToPath } from 'node:url';
 import { DEFAULT_CONFIG } from '../src/core/config.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const profile = await mkdtemp(path.join(tmpdir(), 'beauty-wallet-ui-load-'));
+const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-load-'));
 const config = { ...DEFAULT_CONFIG, theme: 'dark', rpc: { host: '127.0.0.1', port: 1 } };
 await writeFile(path.join(profile, 'config.json'), JSON.stringify(config));
-const env = { ...process.env, BEAUTY_TEST_PROFILE: profile };
+const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile };
 delete env.ELECTRON_RUN_AS_NODE;
 const fixture = {
   phase: 'unlocked', setupActive: false, securityEpoch: 1,
@@ -39,7 +39,7 @@ async function burst(count, transientErrors = false) {
     const contents = BrowserWindow.getAllWindows()[0].webContents;
     for (let index = first; index < first + count; index++) {
       const retrying = transientErrors && index % 4 !== 0;
-      contents.send('beauty:state', { ...snapshot, network: { ...snapshot.network, height: 60000 + index }, claims: {
+      contents.send('connectwallet:state', { ...snapshot, network: { ...snapshot.network, height: 60000 + index }, claims: {
         ...snapshot.claims, sent: index, completed: index, attempts: index,
         status: retrying ? ['retrying', 'waiting', 'submitting'][index % 4 - 1] : 'searching', lastError: retrying ? 'TLS capture or proof validation failed' : null,
         lastErrorDiagnostic: false, lastErrorTransient: retrying,
@@ -62,7 +62,7 @@ try {
   await application.evaluate(({ BrowserWindow }, snapshot) => {
     const window = BrowserWindow.getAllWindows()[0];
     window.setSize(1080, 720);
-    window.webContents.send('beauty:state', snapshot);
+    window.webContents.send('connectwallet:state', snapshot);
   }, fixture);
   await page.locator('[data-view="claims"]').first().click();
   await page.getByRole('heading', { name: 'Every connection has potential.' }).waitFor();
@@ -127,7 +127,7 @@ try {
     return window.loadTestShellReplacements;
   });
   await application.evaluate(({ BrowserWindow }, { snapshot, index }) => {
-    BrowserWindow.getAllWindows()[0].webContents.send('beauty:state', {
+    BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', {
       ...snapshot, network: { ...snapshot.network, height: 60000 + index },
       claims: { ...snapshot.claims, sent: index + 1, completed: index + 1, attempts: index + 1 },
     });
@@ -143,7 +143,7 @@ try {
   await page.mouse.down();
   await burst(100);
   const locked = { ...fixture, phase: 'locked', securityEpoch: 2, wallet: null, history: [], claims: { enabled: false }, diagnostics: null };
-  await application.evaluate(({ BrowserWindow }, snapshot) => BrowserWindow.getAllWindows()[0].webContents.send('beauty:state', snapshot), locked);
+  await application.evaluate(({ BrowserWindow }, snapshot) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', snapshot), locked);
   // Still held: security transitions must not wait for the pointer to finish.
   await page.locator('#unlock-password').waitFor({ timeout: 1000 });
   assert.equal(await page.locator('.shell').count(), 0);
@@ -163,7 +163,7 @@ try {
   // Only remove the exact temporary profile created above, never user data.
   const absolute = path.resolve(profile);
   assert.equal(path.dirname(absolute), path.resolve(tmpdir()));
-  assert.ok(path.basename(absolute).startsWith('beauty-wallet-ui-load-'));
+  assert.ok(path.basename(absolute).startsWith('connectwallet-ui-load-'));
   await rm(absolute, { recursive: true, force: true });
   if (!passed) console.error(`Load metrics: ${JSON.stringify(measurements)}`);
 }

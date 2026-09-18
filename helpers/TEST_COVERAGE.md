@@ -24,7 +24,7 @@ executor survives across all bounties without a 1,000-attempt lifetime cap. A
 second loopback fixture verifies that cancellation interrupts a real blocked
 socket receive rather than waiting for the handshake deadline.
 
-The independent native Core regtest checks Beauty's typed transaction wire
+The independent native Core regtest checks ConnectWallet's typed transaction wire
 encoding, native Schnorr payments, P2C funding and the spending transaction's
 exact challenge. Wallet service tests exercise complete bounty snapshots,
 journal catch-up, reorg/window cleanup, preparation, cancellation and broadcast

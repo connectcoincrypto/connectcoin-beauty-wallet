@@ -9,6 +9,8 @@ import { networkParameters, normalizeMnemonic, validateMnemonic } from './crypto
 const derive = promisify(scrypt);
 const KDF = Object.freeze({ name: 'scrypt', N: 131072, r: 8, p: 1, keyLength: 32 });
 const LIMIT = 131072;
+// Stable authenticated file-format identifier, not UI branding. Changing this
+// would invalidate existing AES-GCM backups and break older wallet readers.
 const FORMAT = 'connectcoin-beauty-wallet';
 const VERSION = 1;
 
@@ -151,7 +153,7 @@ export async function replaceVault(file, payload, password, { expectedFingerprin
   if (!backupInfo.isDirectory() || backupInfo.isSymbolicLink()) throw new Error('Wallet backup directory must not be a symbolic link');
   check();
   const suffix = randomBytes(16).toString('hex');
-  const backupFile = path.join(backups, `wallet-${new Date().toISOString().replace(/[:.]/g, '-')}-${suffix}.beauty.json`);
+  const backupFile = path.join(backups, `wallet-${new Date().toISOString().replace(/[:.]/g, '-')}-${suffix}.connectwallet.json`);
   const temporary = path.join(directory, `.wallet-${suffix}.tmp`);
   let temporaryHandle, backupHandle, backupComplete = false, backupCreated = false;
   try {

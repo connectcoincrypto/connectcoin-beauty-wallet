@@ -25,8 +25,8 @@ test('scrypt/AES-GCM roundtrip and authenticated corruption/wrong password fail 
   await assert.rejects(decryptVault({ ...envelope, salt: '00' }, password), /Invalid/);
 });
 test('exclusive atomic encrypted files, fresh nonce/salt, safe updates, no plaintext leftovers', async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'beauty-wallet-vault-test-'));
-  const file = path.join(directory, 'wallet.beauty');
+  const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-vault-test-'));
+  const file = path.join(directory, 'wallet.connectwallet.json');
   try {
     await createVault(file, payload, password);
     const first = JSON.parse(await readFile(file, 'utf8'));
@@ -38,11 +38,11 @@ test('exclusive atomic encrypted files, fresh nonce/salt, safe updates, no plain
     assert.notEqual(first.salt, second.salt);
     assert.notEqual(first.nonce, second.nonce);
     assert.equal((await unlockVault(file, password)).name, 'Updated');
-    assert.deepEqual(await readdir(directory), ['wallet.beauty']);
+    assert.deepEqual(await readdir(directory), ['wallet.connectwallet.json']);
     assert.equal((await readFile(file, 'utf8')).includes('abandon'), false);
     if (process.platform !== 'win32') assert.equal((await stat(file)).mode & 0o777, 0o600);
   } finally {
-    assert.ok(path.basename(directory).startsWith('beauty-wallet-vault-test-'));
+    assert.ok(path.basename(directory).startsWith('connectwallet-vault-test-'));
     await rm(directory, { recursive: true, force: true });
   }
 });

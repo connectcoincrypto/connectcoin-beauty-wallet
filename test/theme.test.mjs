@@ -18,7 +18,7 @@ test('appearance defaults to system and accepts only the three explicit choices'
 });
 
 test('legacy configurations inherit system and explicit appearance persists without altering network settings', async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'beauty-theme-test-'));
+  const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-theme-test-'));
   try {
     const legacy = { version: 1, network: 'testnet4', rpc: { host: '127.0.0.1', port: 18190 }, autoLockMinutes: 30 };
     await writeFile(path.join(directory, 'config.json'), JSON.stringify(legacy));
@@ -35,7 +35,7 @@ test('legacy configurations inherit system and explicit appearance persists with
   } finally {
     const absolute = path.resolve(directory);
     assert.equal(path.dirname(absolute), path.resolve(tmpdir()));
-    assert.ok(path.basename(absolute).startsWith('beauty-theme-test-'));
+    assert.ok(path.basename(absolute).startsWith('connectwallet-theme-test-'));
     await rm(absolute, { recursive: true, force: true });
   }
 });

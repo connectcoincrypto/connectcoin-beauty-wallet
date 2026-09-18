@@ -196,14 +196,14 @@ function serviceFixture(t, directory = '/unused-discovery-cancellation-test') {
 }
 
 for (const kind of ['cancelled', 'failure', 'uncertain abort']) test(`discovery ${kind} receives the proper diagnostic and UI treatment`, async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'beauty-discovery-cancellation-'));
+  const directory = await mkdtemp(join(tmpdir(), 'connectwallet-discovery-cancellation-'));
   const service = serviceFixture(t, directory);
   service.diagnostics = new DiagnosticLog({ directory });
   t.after(async () => {
     await service.diagnostics.flush();
     const absolute = resolve(directory);
     assert.equal(dirname(absolute), resolve(tmpdir()));
-    assert.ok(basename(absolute).startsWith('beauty-discovery-cancellation-'));
+    assert.ok(basename(absolute).startsWith('connectwallet-discovery-cancellation-'));
     await rm(absolute, { recursive: true, force: true });
   });
   const error = kind === 'failure' ? new Error('Invalid bounty metadata.') : abortError();

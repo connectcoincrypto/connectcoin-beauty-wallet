@@ -21,7 +21,7 @@ listener.listen(0, '127.0.0.1');
 await once(listener, 'listening');
 const port = listener.address().port;
 await new Promise(resolve => listener.close(resolve));
-const directory = await mkdtemp(path.join(tmpdir(), 'beauty-crypto-regtest-'));
+const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-crypto-regtest-'));
 const cookieFile = path.join(directory, 'regtest', '.cookie');
 const stdout = createWriteStream(path.join(directory, 'daemon.log'));
 const child = spawn(binary, [`-datadir=${directory}`, '-regtest', '-server=1', '-listen=0', '-networkactive=0', '-dnsseed=0', '-fixedseeds=0', '-discover=0', '-listenonion=0', '-natpmp=0', '-disablewallet=1', '-test=randomx_mock_pow', '-printtoconsole=1', '-rpcbind=127.0.0.1', '-rpcallowip=127.0.0.1', `-rpcport=${port}`], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -49,7 +49,7 @@ try {
     try { if ((await rpc('getblockchaininfo')).chain === 'regtest') break; }
     catch (error) { if (closed || Date.now() >= until) throw error; await delay(100); }
   }
-  console.log('Isolated regtest ready; generating mock-PoW blocks to Beauty native address.');
+  console.log('Isolated regtest ready; generating mock-PoW blocks to ConnectWallet native address.');
   const blocks = await rpc('generatetoaddress', [103, owner.address]);
   const coins = [];
   for (const hash of blocks.slice(0, 3)) {
@@ -69,7 +69,7 @@ try {
   assert.equal(decoded.vout[0].scriptPubKey.address, receiver.address);
   const accepted = await rpc('testmempoolaccept', [[payment.hex]]);
   assert.equal(accepted[0].allowed, true, JSON.stringify(accepted));
-  console.log('PASS: Core accepted a two-input native Schnorr transaction signed by Beauty.');
+  console.log('PASS: Core accepted a two-input native Schnorr transaction signed by ConnectWallet.');
   assert.equal(await rpc('sendrawtransaction', [payment.hex]), payment.txid);
   await rpc('generatetoaddress', [1, owner.address]);
 
@@ -85,7 +85,7 @@ try {
   assert.equal(expected.txid, prepared.txid);
   assert.equal(expected.clienthello_random, prepared.challenge);
   assert.equal((await rpc('decoderawtransaction', [prepared.hex])).txid, prepared.txid);
-  console.log('PASS: Core accepted P2C funding; its exact ClientHello challenge matches Beauty.');
+  console.log('PASS: Core accepted P2C funding; its exact ClientHello challenge matches ConnectWallet.');
 
   // Tampering after signing must fail at real consensus, not only our verifier.
   const tampered = parseTransaction(bountyTX.hex);
@@ -105,7 +105,7 @@ try {
   }
   await new Promise(resolve => stdout.end(resolve));
   if (success) {
-    assert.ok(path.dirname(directory) === path.resolve(tmpdir()) && path.basename(directory).startsWith('beauty-crypto-regtest-'));
+    assert.ok(path.dirname(directory) === path.resolve(tmpdir()) && path.basename(directory).startsWith('connectwallet-crypto-regtest-'));
     await rm(directory, { recursive: true, force: true });
   } else console.error(`Failure logs preserved in ${directory}`);
 }

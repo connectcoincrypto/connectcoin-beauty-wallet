@@ -4,7 +4,7 @@
 P2C implementation from [connectcoin-p2c-tools](https://github.com/connectcoincrypto/connectcoin-p2c-tools),
 commit `ad35a58a0c59ed985b3566d352053773269e76d2` (0.3.0). The CLI and tests
 are not required at runtime. The upstream license is retained alongside it.
-Beauty Wallet's local hardening in `generator.py` also rejects multicast,
+ConnectWallet's local hardening in `generator.py` also rejects multicast,
 reserved and IPv6 translation/tunnel destinations: `is_global` by itself is
 not a sufficient SSRF boundary. Local patches also add independently cancellable
 capture sockets and completion telemetry. Capture success means completion
@@ -62,9 +62,9 @@ Python virtual environment and installs the pinned provider. Python 3.11+
 must already be installed. This is a local setup operation, never an automatic
 download triggered by a remote bounty. For desktop packaging, run
 `node scripts/setup-claims.mjs --build` on each target OS. The resulting
-`helpers/bin/beauty-claims/` directory must be copied unchanged into Electron's
-external resources (not inside ASAR). Its launcher is `beauty-claims.exe` on
-Windows and `beauty-claims` on macOS/Linux. A user-created source installation
+`helpers/bin/connectwallet-claims/` directory must be copied unchanged into Electron's
+external resources (not inside ASAR). Its launcher is `connectwallet-claims.exe` on
+Windows and `connectwallet-claims` on macOS/Linux. A user-created source installation
 can use the virtual environment instead.
 
 The build copies original Python, provider, CFFI, parser and bootloader notices

@@ -57,8 +57,8 @@ function report(callback, event, details) {
 
 /** Resources must be outside ASAR. An absent helper is explicit, never silently downloaded. */
 export function getClaimsHelper({ basePath = BASE, resourcesPath } = {}) {
-  const executable = process.platform === 'win32' ? 'beauty-claims.exe' : 'beauty-claims';
-  const candidates = [resourcesPath && resolve(resourcesPath, 'claims-helper', executable), resolve(basePath, 'helpers/bin/beauty-claims', executable)].filter(Boolean);
+  const executable = process.platform === 'win32' ? 'connectwallet-claims.exe' : 'connectwallet-claims';
+  const candidates = [resourcesPath && resolve(resourcesPath, 'claims-helper', executable), resolve(basePath, 'helpers/bin/connectwallet-claims', executable)].filter(Boolean);
   for (const command of candidates) if (existsSync(command)) return { command, args: [], packaged: true };
   const command = resolve(basePath, '.claims-venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
   if (existsSync(command)) return { command, args: ['-I', resolve(basePath, 'helpers/claims_bridge.py')], packaged: false };

@@ -13,6 +13,7 @@ import { bountyKey, discoverBounties, readBountyBlock } from './bounty-discovery
 import { DiagnosticLog } from './diagnostics.mjs';
 import { StatePublisher } from './state-publisher.mjs';
 import { performance } from 'node:perf_hooks';
+import { selectVaultFile, VAULT_NAME } from './profile-paths.mjs';
 
 const HASH = /^[0-9a-f]{64}$/;
 const MONEY = /^-?\d{1,19}$/;
@@ -32,7 +33,7 @@ function validateRow(row) {
 export class WalletService extends EventEmitter {
   constructor({ directory, resourcesPath, allowRegtest = false, clientFactory = options => new RpcClient(options), proofRunner, connectionPoolFactory } = {}) {
     super(); Object.assign(this, { directory, resourcesPath, allowRegtest, clientFactory, proofRunner, connectionPoolFactory });
-    this.vaultFile = join(directory, 'wallet.beauty.json');
+    this.vaultFile = join(directory, VAULT_NAME);
     this.diagnostics = null;
     this.session = null; this.epoch = 0; this.setup = null; this.preview = null;
     this.replacement = null; this.walletWrite = null; this.closed = false;
@@ -45,6 +46,7 @@ export class WalletService extends EventEmitter {
     this.statePriority = null;
   }
   async initialize() {
+    this.vaultFile = selectVaultFile(this.directory);
     this.config = await readConfig(this.directory, { allowRegtest: this.allowRegtest });
     this.walletExists = await access(this.vaultFile).then(() => true, () => false);
     this.diagnostics = new DiagnosticLog({ directory: this.directory });

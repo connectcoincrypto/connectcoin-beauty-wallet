@@ -1,6 +1,6 @@
 {
-  "name": "connectcoin-beauty-wallet",
-  "productName": "ConnectCoin Beauty Wallet",
+  "name": "connectcoin-connect-wallet",
+  "productName": "ConnectWallet",
   "version": "0.1.0",
   "description": "A local-key, light ConnectCoin wallet with BIP39 recovery and Automatic Claims",
   "private": true,
@@ -10,7 +10,7 @@
   "author": "ConnectCoin contributors",
   "repository": {
     "type": "git",
-    "url": "https://github.com/connectcoincrypto/connectcoin-beauty-wallet.git"
+    "url": "https://github.com/connectcoincrypto/connectcoin-connect-wallet.git"
   },
   "engines": {
     "node": ">=24"
@@ -45,7 +45,7 @@
     "electron-builder": "26.15.3"
   },
   "build": {
-    "appId": "com.connectcoincrypto.beautywallet",
+    "appId": "com.connectcoincrypto.connectwallet",
     "asar": true,
     "files": [
       "src/**",
@@ -59,7 +59,7 @@
     },
     "extraResources": [
       {
-        "from": "helpers/bin/beauty-claims",
+        "from": "helpers/bin/connectwallet-claims",
         "to": "claims-helper"
       }
     ],
@@ -68,9 +68,10 @@
       "target": [
         "nsis"
       ],
-      "artifactName": "Beauty-Wallet-${version}-${arch}-Setup.${ext}"
+      "artifactName": "ConnectWallet-${version}-${arch}-Setup.${ext}"
     },
     "nsis": {
+      "guid": "d88d5a21-77b9-537e-98d1-01560f964433",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
     },

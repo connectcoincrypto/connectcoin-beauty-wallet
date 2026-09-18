@@ -21,15 +21,15 @@ class OfflineBackend extends EventEmitter {
   request() { throw new Error('Recovery tests must not make network requests.'); }
 }
 async function fixture(t, existing = true) {
-  const directory = await mkdtemp(join(tmpdir(), 'beauty-replacement-test-'));
-  if (existing) await writeFile(join(directory, 'wallet.beauty.json'), originalBytes);
+  const directory = await mkdtemp(join(tmpdir(), 'connectwallet-replacement-test-'));
+  if (existing) await writeFile(join(directory, 'wallet.connectwallet.json'), originalBytes);
   const service = new WalletService({ directory, clientFactory: () => new OfflineBackend() });
   await service.initialize();
   service.refresh = async () => service.getState();
   t.after(async () => {
     await service.close();
     assert.equal(dirname(directory), tmpdir());
-    assert.ok(basename(directory).startsWith('beauty-replacement-test-'));
+    assert.ok(basename(directory).startsWith('connectwallet-replacement-test-'));
     await rm(directory, { recursive: true, force: true });
   });
   return service;

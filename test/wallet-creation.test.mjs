@@ -17,11 +17,11 @@ class OfflineBackend extends EventEmitter {
   request() { throw new Error('Creation tests must not make network requests.'); }
 }
 async function directory(t, beforeCleanup = () => {}) {
-  const value = await mkdtemp(join(tmpdir(), 'beauty-creation-test-'));
+  const value = await mkdtemp(join(tmpdir(), 'connectwallet-creation-test-'));
   t.after(async () => {
     await beforeCleanup();
     assert.equal(dirname(value), resolve(tmpdir()));
-    assert.ok(basename(value).startsWith('beauty-creation-test-'));
+    assert.ok(basename(value).startsWith('connectwallet-creation-test-'));
     await rm(value, { recursive: true, force: true });
   });
   return value;
@@ -59,7 +59,7 @@ test('cancelled initial setup during encryption leaves no wallet or open session
 });
 
 test('cancellation at the final authorization check leaves no first vault or temporary file', async t => {
-  const location = await directory(t), file = join(location, 'wallet.beauty.json');
+  const location = await directory(t), file = join(location, 'wallet.connectwallet.json');
   await assert.rejects(createVault(file, DATA, PASSWORD, {
     check() { throw new Error('cancelled before publication'); },
   }), /cancelled before publication/);
@@ -67,7 +67,7 @@ test('cancellation at the final authorization check leaves no first vault or tem
 });
 
 test('initial publication completes before queued cancellation can run after authorization', async t => {
-  const location = await directory(t), file = join(location, 'wallet.beauty.json');
+  const location = await directory(t), file = join(location, 'wallet.connectwallet.json');
   const originalLink = fsp.link;
   let publishedWhenCancellationRuns = false;
   await withFsOverrides({

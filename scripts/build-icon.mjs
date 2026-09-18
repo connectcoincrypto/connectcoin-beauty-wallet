@@ -1,4 +1,4 @@
-// Render the original vector logo deterministically. PNG-backed ICO entries
+// Render the committed ConnectWallet artwork deterministically. PNG-backed ICO entries
 // are supported by modern Windows/Electron and preserve full alpha transparency.
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -7,7 +7,12 @@ import assert from 'node:assert/strict';
 import { Resvg } from '@resvg/resvg-js';
 
 const assets = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'assets');
-const source = await readFile(path.join(assets, 'icon.svg'), 'utf8');
+const template = await readFile(path.join(assets, 'icon.svg'), 'utf8');
+const mark = await readFile(path.join(assets, 'connectwallet-mark.png'));
+assert.equal(mark.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+assert.equal((template.match(/href="connectwallet-mark\.png"/g) ?? []).length, 1);
+// Embed only this known local asset; icon generation does not fetch resources.
+const source = template.replace('href="connectwallet-mark.png"', `href="data:image/png;base64,${mark.toString('base64')}"`);
 const sizes = [16, 24, 32, 48, 64, 128, 256];
 await mkdir(assets, { recursive: true });
 

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { ConnectionPool } from '../src/core/claim-pool.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const helper = resolve(root, 'helpers/bin/beauty-claims', process.platform === 'win32' ? 'beauty-claims.exe' : 'beauty-claims');
+const helper = resolve(root, 'helpers/bin/connectwallet-claims', process.platform === 'win32' ? 'connectwallet-claims.exe' : 'connectwallet-claims');
 try {
   await access(helper);
   await access(resolve(root, 'assets/icon.png'));

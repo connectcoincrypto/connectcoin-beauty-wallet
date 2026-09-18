@@ -30,7 +30,7 @@ test('claims default to 100 starts and concurrent connections without overwritin
   assert.deepEqual(validateConfig({ claims: { maxConcurrent: 20 } }).claims, { ...expected, maxConcurrent: 20 });
   const example = JSON.parse(await readFile(new URL('../config.example.json', import.meta.url), 'utf8'));
   assert.deepEqual(example.claims, expected);
-  const directory = await mkdtemp(path.join(tmpdir(), 'beauty-claims-defaults-test-'));
+  const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-claims-defaults-test-'));
   try {
     assert.deepEqual((await readConfig(directory)).claims, expected);
     const custom = { maxConnectionsPerSecond: 5, maxConcurrent: 12, lookbackBlocks: 300 };
@@ -38,7 +38,7 @@ test('claims default to 100 starts and concurrent connections without overwritin
     assert.deepEqual((await readConfig(directory)).claims, custom);
   } finally {
     assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
-    assert.ok(path.basename(directory).startsWith('beauty-claims-defaults-test-'));
+    assert.ok(path.basename(directory).startsWith('connectwallet-claims-defaults-test-'));
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -50,7 +50,7 @@ test('network, claims, fee and lock bounds are explicit and testnet only by defa
 });
 
 test('appearance defaults to the system, accepts only explicit supported preferences and persists', async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'beauty-theme-config-test-'));
+  const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-theme-config-test-'));
   try {
     assert.equal(validateConfig({ version: 1 }).theme, 'system');
     for (const theme of ['system', 'light', 'dark']) {
@@ -66,7 +66,7 @@ test('appearance defaults to the system, accepts only explicit supported prefere
     assert.equal((await readConfig(directory)).theme, 'system');
   } finally {
     assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
-    assert.ok(path.basename(directory).startsWith('beauty-theme-config-test-'));
+    assert.ok(path.basename(directory).startsWith('connectwallet-theme-config-test-'));
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -92,7 +92,7 @@ test('Developer Mode defaults off and accepts only boolean values without invoki
   assert.equal(invoked, false);
 });
 test('legacy configurations default Developer Mode off and persist either preference without changing other settings', async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'beauty-developer-mode-config-test-'));
+  const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-developer-mode-config-test-'));
   try {
     const legacy = {
       version: 1, network: 'testnet4', theme: 'dark',
@@ -114,7 +114,7 @@ test('legacy configurations default Developer Mode off and persist either prefer
     }
   } finally {
     assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
-    assert.ok(path.basename(directory).startsWith('beauty-developer-mode-config-test-'));
+    assert.ok(path.basename(directory).startsWith('connectwallet-developer-mode-config-test-'));
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -127,7 +127,7 @@ test('chain tip validates network and pinned genesis, including height-zero cons
   assert.deepEqual(validateTip({ ...tip, height: 0, hash: GENESIS.testnet4 }).hash, GENESIS.testnet4);
 });
 test('config file creation is bounded, atomic, sanitized and rejects malformed UTF8', async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'beauty-config-test-'));
+  const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-config-test-'));
   try {
     assert.deepEqual(await readConfig(directory), DEFAULT_CONFIG);
     await writeConfig(directory, { rpc: { host: '127.0.0.1', port: 18000 }, mnemonic: 'must not persist' });
@@ -139,7 +139,7 @@ test('config file creation is bounded, atomic, sanitized and rejects malformed U
     await writeFile(path.join(directory, 'config.json'), Buffer.from([0xff]));
     await assert.rejects(readConfig(directory));
   } finally {
-    assert.ok(path.basename(directory).startsWith('beauty-config-test-'));
+    assert.ok(path.basename(directory).startsWith('connectwallet-config-test-'));
     await rm(directory, { recursive: true, force: true });
   }
 });

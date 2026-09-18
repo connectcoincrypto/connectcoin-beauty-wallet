@@ -25,7 +25,7 @@ MANIFEST: list[dict] = []
 
 
 def fetch(url: str, limit: int = 20 * 1024 * 1024) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "ConnectCoin-Beauty-License-Bundler/1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "ConnectWallet-License-Bundler/1"})
     with urllib.request.urlopen(request, timeout=45) as response:
         data = response.read(limit + 1)
     if len(data) > limit:

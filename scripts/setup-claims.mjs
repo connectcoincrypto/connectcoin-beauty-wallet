@@ -29,7 +29,7 @@ await run(python, [resolve(base, 'helpers/claims_bridge.py'), '--self-test']);
 await run(python, ['-m', 'unittest', 'discover', '-s', resolve(base, 'helpers/tests'), '-v']);
 if (build) {
   await run(python, [resolve(base, 'helpers/collect_licenses.py')]);
-  await run(python, ['-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--name', 'beauty-claims',
+  await run(python, ['-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--name', 'connectwallet-claims',
     '--distpath', resolve(base, 'helpers/bin'), '--workpath', resolve(base, 'tmp/claims-build'),
     '--specpath', resolve(base, 'tmp'), '--paths', resolve(base, 'helpers/vendor'),
     '--add-data', `${resolve(base, 'helpers/p2c_roots_v1.pem')}${windows ? ';' : ':'}.`,
@@ -37,6 +37,6 @@ if (build) {
     '--add-data', `${resolve(base, 'helpers/PROVENANCE.md')}${windows ? ';' : ':'}licenses`,
     '--add-data', `${resolve(base, 'tmp/claims-licenses')}${windows ? ';' : ':'}licenses/dependencies`,
     resolve(base, 'helpers/claims_bridge.py')]);
-  await run(resolve(base, 'helpers/bin/beauty-claims', windows ? 'beauty-claims.exe' : 'beauty-claims'), ['--self-test']);
+  await run(resolve(base, 'helpers/bin/connectwallet-claims', windows ? 'connectwallet-claims.exe' : 'connectwallet-claims'), ['--self-test']);
 }
 console.log(build ? 'Standalone Automatic Claims helper built and verified.' : 'Automatic Claims helper installed and verified.');

@@ -1,6 +1,6 @@
 # Third-party software
 
-Beauty Wallet uses the following independent projects. This file identifies important dependencies and their licenses; it is not a complete software bill of materials or a replacement for their full license texts. Distributors must retain the applicable notices for the exact dependencies and runtimes included in their packages.
+ConnectWallet uses the following independent projects. This file identifies important dependencies and their licenses; it is not a complete software bill of materials or a replacement for their full license texts. Distributors must retain the applicable notices for the exact dependencies and runtimes included in their packages.
 
 - Electron and Node.js: MIT and bundled third-party notices.
 - `@scure/bip39`, `@scure/bip32`, `@scure/base`, `@noble/curves` and their hash dependency: MIT, Paul Miller and contributors.

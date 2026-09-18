@@ -22,10 +22,10 @@ class Backend extends EventEmitter {
   close() { this.socket=null; }
 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(),'beauty-service-test-'));
+  const directory = await mkdtemp(join(tmpdir(),'connectwallet-service-test-'));
   const service = new WalletService({directory,clientFactory:()=>new Backend(),proofRunner:async()=> '020100'});
   await service.initialize();
-  t.after(async()=>{await service.close();assert.ok(resolve(directory).startsWith(resolve(tmpdir())+ '\\beauty-service-test-') || resolve(directory).startsWith(resolve(tmpdir())+'/beauty-service-test-'));await rm(directory,{recursive:true,force:true});});
+  t.after(async()=>{await service.close();assert.ok(resolve(directory).startsWith(resolve(tmpdir())+ '\\connectwallet-service-test-') || resolve(directory).startsWith(resolve(tmpdir())+'/connectwallet-service-test-'));await rm(directory,{recursive:true,force:true});});
   return service;
 }
 async function create(service) {

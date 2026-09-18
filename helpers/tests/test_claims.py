@@ -39,7 +39,7 @@ def request():
 
 def identity():
     root_key = ec.generate_private_key(ec.SECP256R1())
-    root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Beauty test root")])
+    root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ConnectWallet test root")])
     root = (x509.CertificateBuilder().subject_name(root_name).issuer_name(root_name)
             .public_key(root_key.public_key()).serial_number(1)
             .not_valid_before(datetime(2020, 1, 1, tzinfo=UTC))
@@ -98,7 +98,7 @@ class ClaimsTests(unittest.TestCase):
 
     def test_actual_loopback_tls_capture_verification_and_tampering(self):
         root_pem, cert_pem, key_pem = identity()
-        with tempfile.TemporaryDirectory(prefix="beauty-claims-test-") as directory:
+        with tempfile.TemporaryDirectory(prefix="connectwallet-claims-test-") as directory:
             directory = Path(directory)
             roots = directory / "roots.pem"
             cert = directory / "cert.pem"

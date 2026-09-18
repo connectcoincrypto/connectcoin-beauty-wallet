@@ -12,8 +12,8 @@ import { createRequire } from 'node:module';
 import { waitForUiCondition } from './ui-wait.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const profile = await mkdtemp(path.join(tmpdir(), 'beauty-wallet-ui-test-'));
-const screenshots = await mkdtemp(path.join(tmpdir(), 'beauty-wallet-ui-screens-'));
+const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-test-'));
+const screenshots = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-screens-'));
 const tip = { chain: 'testnet4', height: 0, hash: GENESIS.testnet4, genesis_hash: GENESIS.testnet4, mediantime: 1780000000 };
 const requests = [];
 const sockets = new Set();
@@ -49,11 +49,12 @@ await writeFile(path.join(profile, 'config.json'), JSON.stringify({ version: 1, 
 let application;
 let page;
 const errors = [];
+const failedBrandRequests = [];
 let stage = 'launch';
 let passed = false;
 let seed = [];
 const password = 'UI-test-only-long-password';
-const env = { ...process.env, BEAUTY_TEST_PROFILE: profile };
+const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile };
 delete env.ELECTRON_RUN_AS_NODE;
 
 async function openApplication(executablePath) {
@@ -63,7 +64,22 @@ async function openApplication(executablePath) {
   page = await application.firstWindow();
   page.setDefaultTimeout(15000);
   page.on('pageerror', error => errors.push(error.name));
+  page.on('requestfailed', request => {
+    if (request.url().endsWith('/assets/icon.png')) failedBrandRequests.push(request.failure()?.errorText ?? 'Image request failed');
+  });
   await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
+  assert.equal(await page.title(), 'ConnectWallet · ConnectCoin');
+  assert.equal(await application.evaluate(({ app }) => app.getName()), 'ConnectWallet');
+  assert.equal(await page.locator('.auth-art .brand strong').textContent(), 'ConnectWallet');
+  await assertLoadedImage('.auth-art .brand-mark img');
+}
+async function assertLoadedImage(selector) {
+  // A visible <img> with a cancelled file:// request still occupies its box.
+  // Verify decoded pixels, not only DOM presence or a plausible source URL.
+  await page.waitForFunction(value => {
+    const images = [...document.querySelectorAll(value)];
+    return images.length > 0 && images.every(image => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0);
+  }, selector);
 }
 async function waitForScheme(dark) {
   await page.waitForFunction(expected => matchMedia('(prefers-color-scheme: dark)').matches === expected, dark);
@@ -72,8 +88,8 @@ async function waitForScheme(dark) {
 }
 async function selectTheme(theme, { ui = false } = {}) {
   if (ui) await page.locator('#theme-preference').selectOption(theme);
-  else await page.evaluate(value => window.beauty.invoke('setTheme', { theme: value }), theme);
-  await waitForUiCondition(page, async value => (await window.beauty.invoke('getState')).config.theme === value && document.documentElement.dataset.theme === value && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', theme, { message: 'The saved appearance and idle renderer must match the requested theme.' });
+  else await page.evaluate(value => window.connectwallet.invoke('setTheme', { theme: value }), theme);
+  await waitForUiCondition(page, async value => (await window.connectwallet.invoke('getState')).config.theme === value && document.documentElement.dataset.theme === value && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', theme, { message: 'The saved appearance and idle renderer must match the requested theme.' });
   // Observed Electron runs sometimes expose the new config/CSS just before the
   // native getter agrees. Verify convergence, without assuming its cause or
   // relaxing the requested-value assertion after this bounded wait.
@@ -91,7 +107,7 @@ async function selectTheme(theme, { ui = false } = {}) {
 async function toggleDeveloperMode(enabled) {
   await page.locator('[data-view="settings"]').first().click();
   await page.getByRole('switch', { name: 'Developer Mode', exact: true }).click();
-  await waitForUiCondition(page, async value => (await window.beauty.invoke('getState')).config.developerMode === value && document.querySelector('#developer-mode')?.getAttribute('aria-checked') === String(value) && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', enabled, { message: 'The saved Developer Mode and idle switch must match the requested boolean.' });
+  await waitForUiCondition(page, async value => (await window.connectwallet.invoke('getState')).config.developerMode === value && document.querySelector('#developer-mode')?.getAttribute('aria-checked') === String(value) && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', enabled, { message: 'The saved Developer Mode and idle switch must match the requested boolean.' });
   const persisted = JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).developerMode;
   assert.equal(persisted, enabled, `Developer Mode persistence mismatch (expected=${enabled}, persisted=${typeof persisted === 'boolean' ? persisted : typeof persisted}).`);
 }
@@ -100,11 +116,11 @@ let presentationSequence = 0;
 async function showClaimPresentation({ message, diagnostic, enabled, pageError = null }) {
   // Renderer-only fixtures: no real claims, helper calls or broadcasts. Core
   // tests separately verify how structured rejection codes set this flag.
-  const snapshot = await page.evaluate(() => window.beauty.invoke('getState'));
+  const snapshot = await page.evaluate(() => window.connectwallet.invoke('getState'));
   const status = `presentation-check-${++presentationSequence}`;
   snapshot.claims = { ...snapshot.claims, lastError: message, lastErrorDiagnostic: diagnostic, enabled, status };
   snapshot.error = pageError;
-  await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('beauty:state', value), snapshot);
+  await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', value), snapshot);
   await page.waitForFunction(expected => document.querySelector('.status-badge')?.textContent === expected, status);
 }
 
@@ -116,11 +132,11 @@ try {
   // Screenshots are deliberately limited to screens with no recovery words.
   await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
   await page.screenshot({ path: path.join(screenshots, 'welcome.png') });
-  assert.deepEqual(await page.evaluate(() => [typeof window.require, typeof window.process, Object.isFrozen(window.beauty)]), ['undefined', 'undefined', true]);
-  assert.equal(await page.evaluate(() => window.beauty.invoke('getblocktemplate').then(() => false, () => true)), true);
+  assert.deepEqual(await page.evaluate(() => [typeof window.require, typeof window.process, Object.isFrozen(window.connectwallet)]), ['undefined', 'undefined', true]);
+  assert.equal(await page.evaluate(() => window.connectwallet.invoke('getblocktemplate').then(() => false, () => true)), true);
 
   stage = 'system appearance and startup persistence';
-  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).config.theme, 'system');
+  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.theme, 'system');
   assert.equal(await page.locator('html').getAttribute('data-theme'), 'system');
   assert.equal(await application.evaluate(({ nativeTheme }) => nativeTheme.themeSource), 'system');
   await waitForScheme(await application.evaluate(({ nativeTheme }) => nativeTheme.shouldUseDarkColors));
@@ -133,7 +149,7 @@ try {
   await waitForScheme(false);
   const lightCanvas = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
   assert.notEqual(darkCanvas, lightCanvas);
-  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).config.theme, 'system');
+  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.theme, 'system');
   await selectTheme('dark');
   await page.reload();
   await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
@@ -145,7 +161,7 @@ try {
   await openApplication(executablePath);
   assert.equal(await application.evaluate(({ nativeTheme }) => nativeTheme.themeSource), 'dark');
   await waitForScheme(true);
-  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).config.theme, 'dark');
+  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.theme, 'dark');
   await selectTheme('system');
 
   stage = 'create and backup';
@@ -166,7 +182,7 @@ try {
   assert.equal(await page.locator('.seed-word').count(), 12);
   // OS lock/setup expiry may retain phase='welcome'. A security epoch change
   // must still clear the in-progress phrase and every setup/password field.
-  await page.evaluate(() => window.beauty.invoke('lock'));
+  await page.evaluate(() => window.connectwallet.invoke('lock'));
   await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
   assert.equal(await page.locator('.seed-word').count(), 0);
   assert.equal(await page.locator('input[type="password"]').count(), 0);
@@ -188,10 +204,13 @@ try {
   await page.getByRole('button', { name: 'Open my wallet' }).click();
   await page.getByRole('heading', { name: 'A little more connected.' }).waitFor();
   await waitForUiCondition(page, async () => {
-    const state = await window.beauty.invoke('getState');
+    const state = await window.connectwallet.invoke('getState');
     return state.network.status === 'online' && !state.busy && state.wallet?.balance?.available === '0';
   });
   assert.equal(await page.locator('.seed-word').count(), 0);
+  assert.equal(await page.locator('.sidebar .brand strong').textContent(), 'ConnectWallet');
+  await assertLoadedImage('.sidebar .brand-mark img');
+  await assertLoadedImage('.coin-mark img');
   await page.screenshot({ path: path.join(screenshots, 'overview.png') });
 
   stage = 'appearance settings preserve wallet and drafts';
@@ -199,10 +218,10 @@ try {
   assert.equal(await page.locator('#theme-preference').inputValue(), 'system');
   await page.locator('#rpc-host').fill('127.0.0.2');
   await page.locator('#auto-lock').fill('30');
-  const beforeTheme = await page.evaluate(() => window.beauty.invoke('getState'));
+  const beforeTheme = await page.evaluate(() => window.connectwallet.invoke('getState'));
   const beforeThemeConnections = connectionCount;
   await selectTheme('dark', { ui: true });
-  const afterTheme = await page.evaluate(() => window.beauty.invoke('getState'));
+  const afterTheme = await page.evaluate(() => window.connectwallet.invoke('getState'));
   assert.equal(afterTheme.phase, 'unlocked');
   assert.equal(afterTheme.securityEpoch, beforeTheme.securityEpoch);
   assert.equal(afterTheme.wallet.address, beforeTheme.wallet.address);
@@ -228,6 +247,8 @@ try {
   const address = await page.locator('.address-box').textContent();
   assert.match(address, /^tcc1p[a-z0-9]+$/);
   assert.match(await page.locator('img.qr').getAttribute('src'), /^data:image\/png;base64,/);
+  await assertLoadedImage('.sidebar .brand-mark img');
+  await assertLoadedImage('.receive-card img.qr');
   await page.locator('[data-view="send"]').first().click();
   await page.getByRole('button', { name: 'Create a bounty', exact: true }).click();
   await page.locator('#send-domain').fill('example.com');
@@ -251,14 +272,14 @@ try {
   assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
 
   stage = 'persistent diagnostic history';
-  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).config.developerMode, false);
-  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).diagnostics, null);
+  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.developerMode, false);
+  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).diagnostics, null);
   assert.equal(await page.locator('.diagnostics-card').count(), 0);
   await application.evaluate(({ shell }) => {
     globalThis.diagnosticOpenedPath = null;
     shell.openPath = async value => { globalThis.diagnosticOpenedPath = value; return ''; };
   });
-  assert.equal(await page.evaluate(() => window.beauty.invoke('openDiagnostics').then(() => false, () => true)), true);
+  assert.equal(await page.evaluate(() => window.connectwallet.invoke('openDiagnostics').then(() => false, () => true)), true);
   assert.equal(await application.evaluate(() => globalThis.diagnosticOpenedPath), null);
   const claimWarning = 'The node rejected this claim. Its bounty or proof may no longer be valid.';
   const claimNotice = () => page.locator('.form-card .notice.danger').filter({ hasText: claimWarning });
@@ -270,19 +291,19 @@ try {
   await showClaimPresentation({ message: unknownBroadcast, diagnostic: false, enabled: false, pageError: unknownBroadcast });
   assert.equal(await page.locator('.form-card .notice.danger').filter({ hasText: unknownBroadcast }).isVisible(), true);
   assert.equal(await page.locator('.page-error').isVisible(), true);
-  await page.evaluate(() => window.beauty.invoke('refresh'));
+  await page.evaluate(() => window.connectwallet.invoke('refresh'));
   failNextHistory = true;
   assert.equal(await page.evaluate(async () => {
-    try { await window.beauty.invoke('refresh'); return false; } catch { return true; }
+    try { await window.connectwallet.invoke('refresh'); return false; } catch { return true; }
   }), true);
   await page.locator('.page-error').waitFor();
   assert.equal(await page.locator('.diagnostics-card').count(), 0, 'technical history stays hidden, not important page errors');
-  await page.evaluate(() => window.beauty.invoke('refresh'));
+  await page.evaluate(() => window.connectwallet.invoke('refresh'));
   assert.equal(await page.locator('.page-error').count(), 0);
-  const beforeDeveloper = await page.evaluate(() => window.beauty.invoke('getState'));
+  const beforeDeveloper = await page.evaluate(() => window.connectwallet.invoke('getState'));
   const beforeDeveloperConnections = connectionCount;
   await toggleDeveloperMode(true);
-  const afterDeveloper = await page.evaluate(() => window.beauty.invoke('getState'));
+  const afterDeveloper = await page.evaluate(() => window.connectwallet.invoke('getState'));
   assert.equal(afterDeveloper.phase, beforeDeveloper.phase);
   assert.equal(afterDeveloper.securityEpoch, beforeDeveloper.securityEpoch);
   assert.equal(afterDeveloper.wallet.address, beforeDeveloper.wallet.address);
@@ -314,9 +335,9 @@ try {
   await showClaimPresentation({ message: claimWarning, diagnostic: true, enabled: true });
   assert.equal(await claimNotice().count(), 0);
   assert.equal(await page.locator('.diagnostics-card').count(), 0);
-  assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).diagnostics, null);
+  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).diagnostics, null);
   await page.screenshot({ path: path.join(screenshots, 'claims-normal-mode.png'), fullPage: true });
-  await page.evaluate(() => window.beauty.invoke('refresh'));
+  await page.evaluate(() => window.connectwallet.invoke('refresh'));
 
   stage = 'lock and unlock';
   await page.getByRole('button', { name: 'Lock wallet', exact: true }).click();
@@ -339,18 +360,19 @@ try {
   assert.equal(await page.locator('.modal-seed-grid .seed-word').count(), 12);
   // Lock from the real main-process bridge while a phrase is visible. It must
   // disappear immediately without requiring any renderer close-button action.
-  await page.evaluate(() => window.beauty.invoke('lock'));
+  await page.evaluate(() => window.connectwallet.invoke('lock'));
   await page.locator('#unlock-password').waitFor();
   assert.equal(await page.locator('.seed-word').count(), 0);
   assert.equal(await page.locator('dialog[open]').count(), 0);
-  const encrypted = await readFile(path.join(profile, 'wallet.beauty.json'), 'utf8');
+  const encrypted = await readFile(path.join(profile, 'wallet.connectwallet.json'), 'utf8');
   assert.ok(!encrypted.includes(seed.join(' ')));
   assert.ok(!encrypted.includes(password));
   assert.ok(requests.includes('getaddressbalance'));
   assert.ok(!requests.includes('sendrawtransaction'));
   assert.deepEqual(errors, []);
+  assert.deepEqual(failedBrandRequests, [], 'ConnectWallet artwork must remain allowed by the renderer resource policy.');
   passed = true;
-  console.log(`PASS: real Electron isolation, appearance, Developer Mode visibility and critical alerts, persistence, draft preservation, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure. Screenshots: ${screenshots}`);
+  console.log(`PASS: real Electron isolation, ConnectWallet title and decoded artwork, appearance, Developer Mode visibility and critical alerts, persistence, draft preservation, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure. Screenshots: ${screenshots}`);
 } catch (error) {
   // Avoid Playwright action dumps: they could contain a generated backup word.
   const sourceLine = /test-ui\.mjs:(\d+):\d+/.exec(String(error.stack ?? ''))?.[1];
@@ -365,7 +387,7 @@ try {
   if (passed) {
     const absolute = path.resolve(profile);
     assert.equal(path.dirname(absolute), path.resolve(tmpdir()));
-    assert.ok(path.basename(absolute).startsWith('beauty-wallet-ui-test-'));
+    assert.ok(path.basename(absolute).startsWith('connectwallet-ui-test-'));
     await rm(absolute, { recursive: true, force: true });
   }
 }

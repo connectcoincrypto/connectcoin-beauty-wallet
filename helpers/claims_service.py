@@ -113,8 +113,8 @@ class ClaimsService:
         self.closed = False
         # Two resolver slots cannot occupy the TLS capacity. The same executor
         # serves all domains/bounties for the entire unlocked claims session.
-        self.executor = ThreadPoolExecutor(max_workers=self.concurrency + 2, thread_name_prefix="beauty-p2c")
-        self.scheduler = threading.Thread(target=self._schedule, name="beauty-p2c-scheduler", daemon=True)
+        self.executor = ThreadPoolExecutor(max_workers=self.concurrency + 2, thread_name_prefix="connectwallet-p2c")
+        self.scheduler = threading.Thread(target=self._schedule, name="connectwallet-p2c-scheduler", daemon=True)
         self.scheduler.start()
 
     def emit(self, value):

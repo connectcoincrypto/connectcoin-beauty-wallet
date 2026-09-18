@@ -3,12 +3,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { copyFile, chmod, constants, realpath } from 'node:fs/promises';
 import { WalletService } from './core/wallet-service.mjs';
+import { selectProfileDirectory } from './core/profile-paths.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const INDEX = join(ROOT, 'ui', 'index.html');
 const UI_URL = pathToFileURL(INDEX).href;
+const ICON = join(ROOT, '..', 'assets', 'icon.png');
+const ICON_URL = pathToFileURL(ICON).href;
 const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','confirmSend','newAddress','getRecoveryPhrase','saveConfig','setTheme','setDeveloperMode','setClaims','refresh']);
-const EXTERNAL = new Set(['https://connectcoincrypto.com/','https://connectcoincrypto.com/whitepaper.pdf','https://explorer.connectcoincrypto.com/','https://github.com/connectcoincrypto/connectcoin-beauty-wallet','https://github.com/connectcoincrypto/connectcoin','https://discord.gg/JYWbz5PsPp']);
+const EXTERNAL = new Set(['https://connectcoincrypto.com/','https://connectcoincrypto.com/whitepaper.pdf','https://explorer.connectcoincrypto.com/','https://github.com/connectcoincrypto/connectcoin-connect-wallet','https://github.com/connectcoincrypto/connectcoin','https://discord.gg/JYWbz5PsPp']);
 let window, service, quitting = false, actionInProgress = false;
 const themeBackground = () => nativeTheme.shouldUseDarkColors ? '#17151e' : '#f7f6f2';
 function applyTheme(theme) {
@@ -17,10 +20,20 @@ function applyTheme(theme) {
 }
 
 // Development UI tests use isolated temporary profiles; installed builds ignore this override.
-if (!app.isPackaged && process.env.BEAUTY_TEST_PROFILE) app.setPath('userData', resolve(process.env.BEAUTY_TEST_PROFILE));
-else app.setPath('userData', join(app.getPath('appData'), 'ConnectCoin Beauty Wallet'));
-app.setName('ConnectCoin Beauty Wallet');
-if (!app.requestSingleInstanceLock()) app.quit();
+let profileError;
+try {
+  app.setPath('userData', !app.isPackaged && process.env.CONNECTWALLET_TEST_PROFILE
+    ? resolve(process.env.CONNECTWALLET_TEST_PROFILE)
+    : selectProfileDirectory(app.getPath('appData')));
+} catch (error) { profileError = error; }
+app.setName('ConnectWallet');
+if (profileError) {
+  void app.whenReady().then(() => {
+    dialog.showErrorBox('ConnectWallet could not start', profileError.code === 'WALLET_PROFILE_CONFLICT'
+      ? profileError.message : 'The wallet data folder could not be read safely. Check its permissions and keep any existing wallet files intact.');
+    app.quit();
+  });
+} else if (!app.requestSingleInstanceLock()) app.quit();
 else {
   app.on('second-instance', () => { window?.restore(); window?.focus(); });
   app.on('before-quit', event => {
@@ -41,13 +54,13 @@ else {
     applyTheme(service.config.theme);
     window = new BrowserWindow({
       width: 1380, height: 940, minWidth: 1000, minHeight: 700, show: false,
-      icon: join(ROOT, '..', 'assets', 'icon.png'),
-      title: 'ConnectCoin Beauty Wallet', backgroundColor: themeBackground(),
+      icon: ICON,
+      title: 'ConnectWallet', backgroundColor: themeBackground(),
       webPreferences: {
         preload: join(ROOT, 'preload.cjs'), nodeIntegration: false, contextIsolation: true,
         sandbox: true, webSecurity: true, allowRunningInsecureContent: false,
         webviewTag: false, spellcheck: false, devTools: !app.isPackaged,
-        partition: 'beauty-wallet-ui', navigateOnDragDrop: false,
+        partition: 'connectwallet-ui', navigateOnDragDrop: false,
       },
     });
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -57,22 +70,22 @@ else {
     session.setPermissionRequestHandler((_contents,_permission,callback) => callback(false));
     session.setPermissionCheckHandler(() => false);
     session.webRequest.onBeforeRequest((details, callback) => {
-      const allowed = details.url.startsWith(pathToFileURL(join(ROOT,'ui')).href + '/') || details.url.startsWith('data:image/');
+      const allowed = details.url === ICON_URL || details.url.startsWith(pathToFileURL(join(ROOT,'ui')).href + '/') || details.url.startsWith('data:image/');
       callback({ cancel: !allowed });
     });
     service.on('state', state => {
       applyTheme(state.config.theme);
-      if (window && !window.isDestroyed()) window.webContents.send('beauty:state',state);
+      if (window && !window.isDestroyed()) window.webContents.send('connectwallet:state',state);
     });
     nativeTheme.on('updated', () => {
       if (window && !window.isDestroyed()) window.setBackgroundColor(themeBackground());
     });
     powerMonitor.on('suspend', () => { void service.lock(); });
     powerMonitor.on('lock-screen', () => { void service.lock(); });
-    ipcMain.on('beauty:activity', event => {
+    ipcMain.on('connectwallet:activity', event => {
       if (event.sender === window.webContents && event.senderFrame === window.webContents.mainFrame && event.senderFrame.url === UI_URL) service.activity();
     });
-    ipcMain.handle('beauty:action', async (event,method,payload) => {
+    ipcMain.handle('connectwallet:action', async (event,method,payload) => {
       try {
         if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== UI_URL) throw new Error('Untrusted wallet window.');
         if (typeof method !== 'string' || !payload || typeof payload !== 'object' || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > 16384) throw new Error('Invalid wallet action.');
@@ -103,7 +116,7 @@ else {
             await shell.openExternal(url); value = { opened:true };
           } else if (method === 'exportWallet') {
             service.assertSession();
-            const selection = await dialog.showSaveDialog(window,{ title:'Save encrypted wallet backup',defaultPath:'beauty-wallet-backup.json',filters:[{name:'Encrypted wallet',extensions:['json']}] });
+            const selection = await dialog.showSaveDialog(window,{ title:'Save encrypted wallet backup',defaultPath:'connectwallet-backup.json',filters:[{name:'Encrypted wallet',extensions:['json']}] });
             if (selection.canceled || !selection.filePath) value = { cancelled:true };
             else {
               if (await realpath(selection.filePath).catch(()=>selection.filePath) === await realpath(service.vaultFile)) throw new Error('Choose a different file for your backup.');
@@ -121,8 +134,9 @@ else {
     });
     window.once('ready-to-show', () => { window.show(); });
     await window.loadFile(INDEX);
-  } catch {
-    dialog.showErrorBox('Beauty Wallet could not start','Check the configuration file in your Beauty Wallet data folder. The wallet has not sent any transaction.');
+  } catch (error) {
+    dialog.showErrorBox('ConnectWallet could not start', error.code === 'WALLET_PROFILE_CONFLICT'
+      ? error.message : 'Check the configuration file in your ConnectWallet data folder. The wallet has not sent any transaction.');
     app.quit();
   }
   });

@@ -6,11 +6,11 @@ import { join, isAbsolute, resolve, dirname, basename } from 'node:path';
 import { DiagnosticLog, diagnosticError } from '../src/core/diagnostics.mjs';
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'beauty-diagnostics-'));
+  const directory = await mkdtemp(join(tmpdir(), 'connectwallet-diagnostics-'));
   t.after(() => {
     const absolute = resolve(directory);
     assert.equal(dirname(absolute), resolve(tmpdir()));
-    assert.ok(basename(absolute).startsWith('beauty-diagnostics-'));
+    assert.ok(basename(absolute).startsWith('connectwallet-diagnostics-'));
     return rm(absolute, { recursive: true, force: true });
   });
   return directory;

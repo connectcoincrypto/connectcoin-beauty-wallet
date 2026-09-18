@@ -13,9 +13,9 @@ import { unlockVault } from '../src/core/vault.mjs';
 import { waitForUiCondition } from './ui-wait.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const profile = await mkdtemp(path.join(tmpdir(), 'beauty-wallet-ui-recovery-'));
-const screenshots = await mkdtemp(path.join(tmpdir(), 'beauty-wallet-ui-recovery-screens-'));
-const vaultFile = path.join(profile, 'wallet.beauty.json');
+const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-recovery-'));
+const screenshots = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-recovery-screens-'));
+const vaultFile = path.join(profile, 'wallet.connectwallet.json');
 const backupDirectory = path.join(profile, 'wallet-backups');
 // Public BIP39 test vector, never a funded or user-provided recovery phrase.
 const mnemonic = `${'abandon '.repeat(11)}about`;
@@ -52,7 +52,7 @@ const fixture = net.createServer(socket => {
 });
 await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve));
 await writeFile(path.join(profile, 'config.json'), JSON.stringify({ version: 1, network: 'testnet4', rpc: { host: '127.0.0.1', port: fixture.address().port }, autoLockMinutes: 15 }));
-const env = { ...process.env, BEAUTY_TEST_PROFILE: profile };
+const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile };
 delete env.ELECTRON_RUN_AS_NODE;
 let application;
 let page;
@@ -72,14 +72,14 @@ async function ready() {
   // The real 48-per-minute quota requires one full 60-second window; allow at
   // most 90 seconds including KDF/UI overhead. Keep the complete !busy check.
   await waitForUiCondition(page, async () => {
-    const state = await window.beauty.invoke('getState');
+    const state = await window.connectwallet.invoke('getState');
     return state.phase === 'unlocked' && state.network.status === 'online' && !state.busy && !state.wallet.recovering;
   }, null, { timeout: 90000, message: 'The isolated recovery and its quota-paced refresh must finish.' });
   await page.waitForFunction(() => document.querySelector('#app')?.getAttribute('aria-busy') !== 'true');
-  return page.evaluate(() => window.beauty.invoke('getState'));
+  return page.evaluate(() => window.connectwallet.invoke('getState'));
 }
 async function lock() {
-  await page.evaluate(() => window.beauty.invoke('lock'));
+  await page.evaluate(() => window.connectwallet.invoke('lock'));
   await page.locator('#unlock-password').waitFor();
   assert.equal(await page.locator('.seed-word').count(), 0);
   assert.equal(await page.locator('dialog[open]').count(), 0);
@@ -104,7 +104,7 @@ async function begin(mode, { testAcknowledgement = false } = {}) {
     if (await proceed.isEnabled()) await proceed.click();
     assert.equal(await page.locator('dialog[open]').count(), 1);
     assert.equal(await page.locator('#restore-form, #create-form').count(), 0);
-    assert.equal((await page.evaluate(() => window.beauty.invoke('getState'))).phase, 'locked');
+    assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).phase, 'locked');
   }
   await page.locator('#replacement-ack').check();
   await proceed.click();
@@ -146,7 +146,7 @@ async function createReplacement() {
 try {
   await launch();
   await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
-  await page.evaluate(data => window.beauty.invoke('restoreWallet', data), { name: 'Original isolated wallet', mnemonic, password: oldPassword });
+  await page.evaluate(data => window.connectwallet.invoke('restoreWallet', data), { name: 'Original isolated wallet', mnemonic, password: oldPassword });
   const originalAddress = (await ready()).wallet.address;
   await lock();
   await page.screenshot({ path: path.join(screenshots, 'locked-recovery-options.png') });
@@ -275,7 +275,7 @@ try {
   if (passed) {
     const absolute = path.resolve(profile);
     assert.equal(path.dirname(absolute), path.resolve(tmpdir()));
-    assert.ok(path.basename(absolute).startsWith('beauty-wallet-ui-recovery-'));
+    assert.ok(path.basename(absolute).startsWith('connectwallet-ui-recovery-'));
     await rm(absolute, { recursive: true, force: true });
   }
 }

@@ -180,8 +180,8 @@ test('a winning proof aggregates sibling cancellation separately from stop', asy
 });
 
 test('progress allowlists exclude arbitrary reasons, duration labels, nested data and overflowing counters', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'beauty-progress-'));
-  t.after(async () => { const path = resolve(directory); assert.equal(dirname(path), resolve(tmpdir())); assert.ok(basename(path).startsWith('beauty-progress-')); await rm(path, { recursive: true, force: true }); });
+  const directory = await mkdtemp(join(tmpdir(), 'connectwallet-progress-'));
+  t.after(async () => { const path = resolve(directory); assert.equal(dirname(path), resolve(tmpdir())); assert.ok(basename(path).startsWith('connectwallet-progress-')); await rm(path, { recursive: true, force: true }); });
   const log = new DiagnosticLog({ directory }); let invoked = 0;
   log.record('claims.progress', { stage: 'lifecycle', runId: 1, prepareActive: 4, dnsActive: 2, captureActive: 256, submitActive: 4,
     operationsStarted: 1000, operationsCompleted: 500, operationsFailed: 2, operationsCancelled: 3, cancelledStop: 3,
