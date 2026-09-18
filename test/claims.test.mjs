@@ -150,32 +150,46 @@ test('engine is opt-in, deduplicates bounties, preserves prepared txid, and subm
   assert.equal(engine.enqueue([bounty()]), 0);
 });
 
-test('wallet lock during generation never submits a found proof', async () => {
+test('wallet lock during concurrent generation never submits found proofs', async t => {
   let unlocked = true;
-  let resolveProof;
+  const proofs = [];
   let submitted = false;
-  const engine = new ClaimsEngine({ isUnlocked: () => unlocked, prepare: async () => ({ context: context() }), generateProof: () => new Promise((resolve) => { resolveProof = resolve; }), submit: async () => { submitted = true; } });
+  const engine = new ClaimsEngine({ options: { concurrency: 3, connectionsPerSecond: 256 }, isUnlocked: () => unlocked,
+    prepare: async () => ({ context: context() }), generateProof: () => new Promise(resolve => proofs.push(resolve)),
+    submit: async () => { submitted = true; } });
+  t.after(async () => { const stopped = engine.stop(); for (const resolve of proofs) resolve('020100'); await stopped; });
   engine.enqueue([bounty()]);
   engine.start();
-  await until(() => resolveProof);
+  await until(() => proofs.length === 3);
   unlocked = false;
-  resolveProof('020100');
+  for (const resolve of proofs) resolve('020100');
   await until(() => !engine.running);
   assert.equal(submitted, false);
   assert.equal(engine.enabled, false);
   await engine.stop();
 });
 
-test('stop aborts active work and forbids another worker until cleanup', async () => {
-  let started = false;
-  let release;
+test('stop aborts every concurrent worker and forbids restart until all cleanup finishes', async t => {
+  let started = 0;
+  const releases = [];
   let submitted = false;
-  const engine = new ClaimsEngine({ isUnlocked: () => true, prepare: async () => ({ context: context() }), generateProof: (_, { signal }) => new Promise((resolve, reject) => { started = true; signal.addEventListener('abort', () => { release = () => reject(Object.assign(new Error('cancelled'), { name: 'AbortError' })); }); }), submit: async () => { submitted = true; } });
+  const engine = new ClaimsEngine({ options: { concurrency: 3, connectionsPerSecond: 256 }, isUnlocked: () => true,
+    prepare: async () => ({ context: context() }), generateProof: (_, { signal }) => new Promise((resolve, reject) => {
+      started++; signal.addEventListener('abort', () => releases.push(() => reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }))), { once: true });
+    }), submit: async () => { submitted = true; } });
+  t.after(async () => { const stopped = engine.stop(); for (const release of releases) release(); await stopped; });
   engine.enqueue([bounty()]); engine.start();
-  await until(() => started);
+  await until(() => started === 3);
   const stopped = engine.stop();
+  assert.equal(releases.length, 3);
+  let settled = false;
+  void stopped.then(() => { settled = true; });
+  // Releasing only the last mock used to leave earlier concurrent calls stuck.
+  releases.at(-1)();
+  await tick();
+  assert.equal(settled, false);
   assert.throws(() => engine.start(), /previous claims worker/);
-  release();
+  for (const release of releases) release();
   await stopped;
   assert.equal(submitted, false);
   assert.equal(engine.running, null);

@@ -17,7 +17,7 @@
   },
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test --test-timeout=60000 test/*.test.mjs",
     "check": "node scripts/check.mjs",
     "test:ui": "node scripts/test-ui.mjs",
     "test:ui:load": "node scripts/test-ui-load.mjs",

@@ -21,7 +21,9 @@ jobs:
           python-version: '3.13'
       - run: npm ci
       - run: npm run check
-      - run: npm test
+      - name: Test wallet logic with bounded waits
+        timeout-minutes: 5
+        run: npm test
       - run: npm run setup:claims
       - name: Install Linux Electron test dependencies
         if: runner.os == 'Linux'

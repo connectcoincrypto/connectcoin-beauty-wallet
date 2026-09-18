@@ -154,11 +154,16 @@ test('lock emits cleared secrets before slow helper shutdown and close drains en
   s.persisting=new Promise(resolve=>{finishWrite=resolve;});
   const states=[];s.on('state',state=>states.push(state));
   let closed=false;const closing=s.close().then(()=>{closed=true;});
-  assert.ok(states.some(state=>state.phase==='locked'&&state.wallet===null));
-  assert.equal(closed,false);finishStop();
-  await new Promise(resolve=>setImmediate(resolve));assert.equal(closed,false);
-  finishWrite();await closing;assert.equal(closed,true);
-  s.engine.stop=originalStop;
+  try {
+    assert.ok(states.some(state=>state.phase==='locked'&&state.wallet===null));
+    assert.equal(closed,false);finishStop();
+    await new Promise(resolve=>setImmediate(resolve));assert.equal(closed,false);
+    finishWrite();await closing;assert.equal(closed,true);
+  } finally {
+    s.engine.stop=originalStop;
+    finishStop?.();finishWrite?.();
+    await closing;
+  }
 });
 
 test('closing drains an interrupted refresh as cancellation before the lifecycle marker', async t => {

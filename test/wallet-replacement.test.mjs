@@ -186,10 +186,15 @@ test('an old encrypted write is drained before authorization and replacement', a
   s.persisting = new Promise(resolve => { finish = resolve; });
   let authorized = false;
   const pending = s.beginWalletReplacement({ mode: 'recover' }).then(value => { authorized = true; return value; });
-  await new Promise(resolve => setImmediate(resolve)); assert.equal(authorized, false);
-  finish(); const { replacementId } = await pending;
-  await s.restoreWallet(input(replacementId));
-  assert.equal(s.session.data.name, 'Recovered wallet');
+  try {
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(authorized, false);
+    finish(); const { replacementId } = await pending;
+    await s.restoreWallet(input(replacementId));
+    assert.equal(s.session.data.name, 'Recovered wallet');
+  } finally {
+    finish();
+    await pending;
+  }
 });
 
 test('changed vault and backup failures leave the active wallet untouched', async t => {

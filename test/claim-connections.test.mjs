@@ -319,15 +319,21 @@ test('a late TCP-start acknowledgement after stop counts the attempt without rev
   const { engine } = fixture(t, {
     transformPool: pool => ({ ...pool, attempt(ctx, options) { request = { ctx, ...options }; return new Promise(resolve => { finish = resolve; }); } }),
   });
-  engine.enqueue([row()]); engine.start(); await until(() => request);
-  const stopping = engine.stop();
-  assert.equal(request.signal.aborted, true);
-  request.onStarted();
-  assert.equal(engine.snapshot().attempts, 1);
-  assert.equal(engine.enabled, false); assert.equal(engine.snapshot().status, 'off');
-  finish({ started: true, captured: false, cancelled: true, seconds: 0, proof: null, verified: false });
-  await stopping;
-  assert.equal(engine.snapshot().status, 'off'); assert.equal(engine.activeKeys().size, 0);
+  const cancelled = { started: true, captured: false, cancelled: true, seconds: 0, proof: null, verified: false };
+  try {
+    engine.enqueue([row()]); engine.start(); await until(() => request);
+    const stopping = engine.stop();
+    assert.equal(request.signal.aborted, true);
+    request.onStarted();
+    assert.equal(engine.snapshot().attempts, 1);
+    assert.equal(engine.enabled, false); assert.equal(engine.snapshot().status, 'off');
+    finish(cancelled);
+    await stopping;
+    assert.equal(engine.snapshot().status, 'off'); assert.equal(engine.activeKeys().size, 0);
+  } finally {
+    finish?.(cancelled);
+    await engine.stop();
+  }
 });
 
 test('outpoint invalidation aborts an active retry submission, not only its original TLS request', async t => {
