@@ -37,6 +37,13 @@ function serviceFixture({ height = 600, bountyHeight = 1 } = {}) {
   };
   const service = new WalletService({ directory: '/unused-claim-window-unit-test', clientFactory: () => new EventEmitter() });
   service.config = structuredClone(DEFAULT_CONFIG);
+  service.config.claims.maxConcurrent = 1;
+  // Never start the installed network helper from unit tests. The callback is
+  // injected before createEngine; individual scenarios supply an offline result.
+  service.proofRunner = (...args) => {
+    if (!service.testProofRunner) throw new Error('Missing isolated proof fixture');
+    return service.testProofRunner(...args);
+  };
   service.session = { data: {} }; service.epoch = 7;
   service.tip = tip(height); service.rpc = rpc;
   service.engine = { enabled: true, async stop() { this.enabled = false; }, clear() {} };
@@ -64,6 +71,50 @@ test('an available bounty older than 600 blocks can prepare and submit without p
   const result = await service.submitAutomaticClaim(prepared, structuralProof(prepared));
   assert.equal(result.txid, prepared.txid);
   assert.deepEqual(calls.map(call => call.method), ['sendrawtransaction']);
+});
+
+test('retries reuse the fixed claim fee, payout and receiving address while refreshing certificate time', async () => {
+  const { service, bounty, raw, calls } = serviceFixture();
+  let fundingReads = 0;
+  service.funding = async () => { fundingReads++; return raw; };
+  const prepared = await service.prepareAutomaticClaim(bounty);
+  const other = deriveAccount('abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about', { index: 1 });
+  other.privateKey.fill(0);
+  service.getState = () => ({ wallet: { address: other.address } });
+  service.config.feeRate *= 2;
+  service.tip = tip(601);
+  const resumed = await service.prepareAutomaticClaim(bounty, { previous: prepared });
+  assert.notEqual(other.address, prepared.rewardAddress);
+  assert.equal(resumed.rewardAddress, prepared.rewardAddress);
+  assert.equal(resumed.fee, prepared.fee); assert.equal(resumed.payout, prepared.payout);
+  assert.equal(resumed.hex, prepared.hex); assert.equal(resumed.txid, prepared.txid);
+  assert.equal(resumed.challenge, prepared.challenge);
+  assert.equal(resumed.context.validation_time, tip(601).mediantime);
+  assert.equal(fundingReads, 2, 'retained challenge still reauthenticates funding');
+  assert.equal(calls.length, 0, 'unit preparation makes no RPC network request');
+});
+
+for (const boundary of ['epoch', 'RPC']) test(`a retained claim cannot reuse its proposal across a changed ${boundary}`, async () => {
+  const { service, bounty } = serviceFixture();
+  const prepared = await service.prepareAutomaticClaim(bounty);
+  const other = deriveAccount('abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about', { index: 1 });
+  other.privateKey.fill(0);
+  service.getState = () => ({ wallet: { address: other.address } });
+  service.config.feeRate *= 2;
+  if (boundary === 'epoch') service.epoch++;
+  else service.rpc = new EventEmitter();
+  const renewed = await service.prepareAutomaticClaim(bounty, { previous: prepared });
+  assert.equal(renewed.rewardAddress, other.address);
+  assert.notEqual(renewed.fee, prepared.fee); assert.notEqual(renewed.txid, prepared.txid);
+});
+
+test('a cached fixed proposal never bypasses funding authentication on retry', async () => {
+  const { service, bounty, raw } = serviceFixture();
+  const prepared = await service.prepareAutomaticClaim(bounty);
+  const tampered = parseTransaction(raw);
+  tampered.outputs[0].amount = '2000000000';
+  service.funding = async () => serializeTransaction(tampered).toString('hex');
+  await assert.rejects(service.prepareAutomaticClaim(bounty, { previous: prepared }), /transaction|funding|match/i);
 });
 
 test('a claim crossing the discovery boundary during preparation and proof generation still submits', async () => {
@@ -141,17 +192,18 @@ test('the shared validated tip is cleared on reconnect, current RPC disconnectio
   assert.equal(service.tip, null);
 });
 
-for (const stage of ['prepare', 'proof', 'submit']) test(`retirement during ${stage} preserves the current attempt but removes unstarted jobs`, async t => {
+for (const stage of ['prepare', 'proof', 'submit']) test(`retirement during ${stage} preserves only work whose TCP attempt already started`, async t => {
   const gate = deferred(); let entered = false, submitted = 0;
-  const engine = new ClaimsEngine({ isUnlocked: () => true,
+  const engine = new ClaimsEngine({ isUnlocked: () => true, randomIndex: () => 0, options: { connectionsPerSecond: 256, concurrency: 1 },
     prepare: async () => { if (stage === 'prepare') { entered = true; await gate.promise; } return { context: context() }; },
     generateProof: async () => { if (stage === 'proof') { entered = true; await gate.promise; } return '020100'; },
     submit: async () => { if (stage === 'submit') { entered = true; await gate.promise; } submitted++; return context().txid; },
   });
   t.after(async () => { gate.resolve(); await engine.stop(); });
   const active = row(), queued = row(1, { vout: 1 });
-  engine.enqueue([active, queued]); engine.start();
+  engine.enqueue([active]); engine.start();
   await until(() => entered);
+  engine.enqueue([queued]);
   engine.retire(active.txid, active.vout); engine.retire(queued.txid, queued.vout);
   assert.equal(engine.controller.signal.aborted, false);
   assert.equal(engine.queue.size, 1);
@@ -159,14 +211,14 @@ for (const stage of ['prepare', 'proof', 'submit']) test(`retirement during ${st
   assert.equal(engine.enqueue([active]), 0, 'an in-flight retired job cannot be duplicated');
   gate.resolve();
   await until(() => !engine.running);
-  assert.equal(submitted, 1);
-  assert.equal(engine.snapshot().completed, 1);
+  assert.equal(submitted, stage === 'prepare' ? 0 : 1);
+  assert.equal(engine.snapshot().completed, stage === 'prepare' ? 0 : 1);
   assert.equal(engine.queue.size, 0);
 });
 
 test('a retired failed attempt is discarded instead of retrying outside discovery', async t => {
   const gate = deferred(); let entered = false, attempts = 0;
-  const engine = new ClaimsEngine({ isUnlocked: () => true, retryDelayMs: 1,
+  const engine = new ClaimsEngine({ isUnlocked: () => true, retryDelayMs: 1, options: { connectionsPerSecond: 256, concurrency: 1 },
     prepare: async () => { attempts++; return { context: context() }; },
     generateProof: async () => { entered = true; await gate.promise; throw new Error('Mocked TLS failure'); },
     submit: async () => { throw new Error('A failed proof must never be submitted'); },
@@ -181,7 +233,7 @@ test('a retired failed attempt is discarded instead of retrying outside discover
 
 for (const action of ['remove', 'clear', 'stop', 'suspend', 'lock']) test(`retirement does not override ${action} cancellation`, async t => {
   const gate = deferred(); let entered = false, submitted = false, unlocked = true;
-  const engine = new ClaimsEngine({ isUnlocked: () => unlocked,
+  const engine = new ClaimsEngine({ isUnlocked: () => unlocked, options: { connectionsPerSecond: 256, concurrency: 1 },
     prepare: async () => ({ context: context() }),
     generateProof: async () => { entered = true; await gate.promise; return '020100'; },
     submit: async () => { submitted = true; },
@@ -213,6 +265,25 @@ function mockDiscovery(service, { height, reorg = false, event = null, rows = []
   service.blockBounties = async blockHash => rows.filter(value => value.block_hash === blockHash);
 }
 
+test('a complete discovery rescan keeps each surviving bounty factor and domain history', async t => {
+  const { service, bounty } = serviceFixture();
+  service.createEngine();
+  t.after(() => service.engine.stop());
+  service.engine.enabled = true;
+  service.engine.kick = () => {}; // Exercise discovery only, never launch the TLS helper.
+  let draws = 0;
+  service.engine.randomIndex = () => ++draws;
+  service.engine.enqueue([bounty]);
+  const job = service.engine.queue.get(bountyKey(bounty)), factor = job.factor;
+  service.engine.recordAttemptStats(job, { completed: 1, recent: [[true, 0.1]] }, 0);
+  service.claimCursor = null; // An expired cursor requires the same full-rescan path.
+  mockDiscovery(service, { height: 600, rows: [bounty] });
+  await service.syncBountiesInternal(service.epoch);
+  assert.equal(service.engine.queue.get(bountyKey(bounty)).factor, factor);
+  assert.equal(service.engine.domainStats.get('example.com:7').attempts.length, 1);
+  assert.equal(draws, 1, 'resynchronizing discovery must not reroll a surviving bounty');
+});
+
 for (const result of ['success', 'failure']) test(`window rollover retains only active local metadata and releases it after ${result}`, async t => {
   const { service, bounty, calls } = serviceFixture();
   const bounties = Array.from({ length: 1000 }, (_, vout) => ({ ...bounty, vout }));
@@ -220,9 +291,10 @@ for (const result of ['success', 'failure']) test(`window rollover retains only 
   service.claimOutpoints = new Map(bounties.map(value => [bountyKey(value), value]));
   const gate = deferred(); let prepared, entered = false;
   service.createEngine();
+  service.engine.randomIndex = () => 0;
   const prepare = service.engine.prepare;
   service.engine.prepare = async (...args) => { prepared = await prepare(...args); return prepared; };
-  service.engine.generateProof = async () => { entered = true; await gate.promise; if (result === 'failure') throw new Error('Mocked TLS failure'); return structuralProof(prepared); };
+  service.testProofRunner = async () => { entered = true; await gate.promise; if (result === 'failure') throw new Error('Mocked TLS failure'); return structuralProof(prepared); };
   t.after(async () => { gate.resolve(); await service.engine.stop(); });
   service.engine.enqueue(bounties); service.engine.start(); await until(() => entered);
   mockDiscovery(service, { height: 601 });
@@ -235,7 +307,7 @@ for (const result of ['success', 'failure']) test(`window rollover retains only 
   gate.resolve(); await until(() => !service.engine.running);
   assert.equal(service.claimOutpoints.size, 0, 'settled retired metadata must not accumulate');
   assert.equal(service.engine.queue.size, 0);
-  assert.equal(service.retiredClaim == null, true);
+  assert.equal(service.retiredClaims.size, 0);
   assert.equal(service.engine.enabled, true);
   assert.equal(calls.filter(call => call.method === 'getchaintip').length, 0);
   assert.equal(calls.filter(call => call.method === 'sendrawtransaction').length, result === 'success' ? 1 : 0);
@@ -247,7 +319,7 @@ for (const reason of ['spent', 'pending_spend', 'reorg']) test(`${reason} cancel
   service.createEngine();
   const prepare = service.engine.prepare;
   service.engine.prepare = async (...args) => { prepared = await prepare(...args); return prepared; };
-  service.engine.generateProof = async () => { entered = true; await gate.promise; return structuralProof(prepared); };
+  service.testProofRunner = async () => { entered = true; await gate.promise; return structuralProof(prepared); };
   t.after(async () => { gate.resolve(); await service.engine.stop(); });
   service.engine.enqueue([bounty]); service.engine.start(); await until(() => entered);
   const signal = service.engine.controller.signal;
@@ -282,7 +354,7 @@ for (const when of ['later scan', 'same scan']) test(`a retired in-flight claim 
   service.createEngine();
   const prepare = service.engine.prepare;
   service.engine.prepare = async (...args) => { prepared = await prepare(...args); return prepared; };
-  service.engine.generateProof = async () => { entered = true; await gate.promise; return structuralProof(prepared); };
+  service.testProofRunner = async () => { entered = true; await gate.promise; return structuralProof(prepared); };
   t.after(async () => { gate.resolve(); await service.engine.stop(); });
   service.engine.enqueue([bounty]); service.engine.start(); await until(() => entered);
   const signal = service.engine.controller.signal;
@@ -316,7 +388,7 @@ test('a journal window_exit retires an active proof without aborting its submiss
   service.createEngine();
   const prepare = service.engine.prepare;
   service.engine.prepare = async (...args) => { prepared = await prepare(...args); return prepared; };
-  service.engine.generateProof = async () => { entered = true; await gate.promise; return structuralProof(prepared); };
+  service.testProofRunner = async () => { entered = true; await gate.promise; return structuralProof(prepared); };
   t.after(async () => { gate.resolve(); await service.engine.stop(); });
   service.engine.enqueue([bounty]); service.engine.start(); await until(() => entered);
   const signal = service.engine.controller.signal;

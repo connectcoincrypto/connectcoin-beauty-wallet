@@ -32,15 +32,20 @@ let passed = false;
 const errors = [];
 const measurements = {};
 
-async function burst(count) {
+async function burst(count, transientErrors = false) {
   const first = sequence + 1;
   sequence += count;
-  await application.evaluate(({ BrowserWindow }, { snapshot, first, count }) => {
+  await application.evaluate(({ BrowserWindow }, { snapshot, first, count, transientErrors }) => {
     const contents = BrowserWindow.getAllWindows()[0].webContents;
     for (let index = first; index < first + count; index++) {
-      contents.send('beauty:state', { ...snapshot, network: { ...snapshot.network, height: 60000 + index }, claims: { ...snapshot.claims, sent: index, completed: index, attempts: index } });
+      const retrying = transientErrors && index % 4 !== 0;
+      contents.send('beauty:state', { ...snapshot, network: { ...snapshot.network, height: 60000 + index }, claims: {
+        ...snapshot.claims, sent: index, completed: index, attempts: index,
+        status: retrying ? ['retrying', 'waiting', 'submitting'][index % 4 - 1] : 'searching', lastError: retrying ? 'TLS capture or proof validation failed' : null,
+        lastErrorDiagnostic: false, lastErrorTransient: retrying,
+      } });
     }
-  }, { snapshot: fixture, first, count });
+  }, { snapshot: fixture, first, count, transientErrors });
 }
 async function waitForLatest() {
   await page.waitForFunction(height => document.querySelector('.bottom-strip')?.textContent.includes(`Block ${height.toLocaleString('en-US')}`), 60000 + sequence, { timeout: 5000 });
@@ -83,14 +88,21 @@ try {
   assert.equal(await page.locator('.stat-card').nth(2).locator('strong').textContent(), '1,000');
   assert.ok(Math.abs(await page.evaluate(() => window.scrollY) - scrollBefore) <= 2, 'Background progress reset the scroll position.');
 
-  stage = 'navigation during a held pointer';
+  stage = '1000 alternating transient errors';
+  const beforeErrors = await page.evaluate(() => window.loadTestShellReplacements);
+  await burst(1000, true); await waitForLatest();
+  measurements.errorReplacements = await page.evaluate(() => window.loadTestShellReplacements) - beforeErrors;
+  assert.ok(measurements.errorReplacements < 100, `Retry warnings caused ${measurements.errorReplacements} shell replacements.`);
+  assert.ok(Math.abs(await page.evaluate(() => window.scrollY) - scrollBefore) <= 2, 'Retry warnings reset scroll.');
+
+  stage = 'navigation during a held pointer and transient errors';
   const settings = page.locator('[data-view="settings"]').first();
   const box = await settings.boundingBox();
   assert.ok(box);
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await page.mouse.down();
   await page.evaluate(() => { window.loadTestPressedButton = document.querySelector('[data-view="settings"]'); });
-  await burst(100);
+  await burst(100, true);
   await delay(450);
   assert.equal(await page.evaluate(() => window.loadTestPressedButton.isConnected), true, 'Background state detached the pressed navigation button before pointerup.');
   await page.mouse.up();
@@ -142,7 +154,7 @@ try {
   assert.equal(await page.locator('#rpc-host').count(), 0);
   assert.deepEqual(errors, []);
   passed = true;
-  console.log(`PASS: isolated renderer load, 500 history rows, 1000-update burst (${measurements.burstMs} ms; ${measurements.shellReplacements} shell replacements), held-pointer navigation, scroll/draft/focus retention, unchanged-page DOM identity, immediate lock over pending progress. No wallet or RPC used.`);
+  console.log(`PASS: isolated renderer load, 500 history rows, 1000-update burst (${measurements.burstMs} ms; ${measurements.shellReplacements} shell replacements), 1000 transient errors (${measurements.errorReplacements} replacements), held-pointer navigation, scroll/draft/focus retention, unchanged-page DOM identity, immediate lock over pending progress. No wallet or RPC used.`);
 } catch (error) {
   console.error(`UI load test failed during ${stage}: ${error.stack ?? error}`);
   process.exitCode = 1;

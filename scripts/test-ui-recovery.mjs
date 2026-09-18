@@ -10,6 +10,7 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { GENESIS } from '../src/core/config.mjs';
 import { unlockVault } from '../src/core/vault.mjs';
+import { waitForUiCondition } from './ui-wait.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const profile = await mkdtemp(path.join(tmpdir(), 'beauty-wallet-ui-recovery-'));
@@ -67,10 +68,13 @@ async function launch() {
   page.on('pageerror', error => errors.push(error.name));
 }
 async function ready() {
-  await page.waitForFunction(async () => {
+  // Recovery needs up to 80 history calls: 40 for discovery and 40 for refresh.
+  // The real 48-per-minute quota requires one full 60-second window; allow at
+  // most 90 seconds including KDF/UI overhead. Keep the complete !busy check.
+  await waitForUiCondition(page, async () => {
     const state = await window.beauty.invoke('getState');
     return state.phase === 'unlocked' && state.network.status === 'online' && !state.busy && !state.wallet.recovering;
-  }, null, { timeout: 30000 });
+  }, null, { timeout: 90000, message: 'The isolated recovery and its quota-paced refresh must finish.' });
   await page.waitForFunction(() => document.querySelector('#app')?.getAttribute('aria-busy') !== 'true');
   return page.evaluate(() => window.beauty.invoke('getState'));
 }

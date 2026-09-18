@@ -223,20 +223,98 @@ test('quota survives reconnection and block quotas are canonical per block', asy
 });
 
 test('queued parameters are snapshotted, close aborts pace waiters, connection-close race settles', async () => {
-  const server = await mock((request, socket) => socket.write(line(response(request, request.params))), { quota: 1, windowMs: 1000 });
+  const events = [];
+  const server = await mock((request, socket) => socket.write(line(response(request, request.params))), {
+    quota: 1, windowMs: 1000, onDiagnostic: (event, details) => events.push({ event, details }),
+  });
   try {
     const params = { txid: hash };
     const first = server.client.request('gettransaction', params); params.txid = 'b'.repeat(64);
     assert.deepEqual(await first, { txid: hash });
     const waiting = server.client.request('gettransaction', { txid: hash });
-    const assertion = assert.rejects(bounded(waiting), /abort|closed/i);
+    const assertion = assert.rejects(bounded(waiting), error => error.name === 'AbortError' && error.code === 'ABORT_ERR');
     server.client.close(); await assertion; assert.equal(server.client.queuedRequests, 0);
+    assert.equal(events.filter(item => item.event === 'rpc.cancelled').length, 1);
+    assert.equal(events.some(item => item.event === 'rpc.failed'), false);
   } finally { await server.close(); }
-  const race = await mock((request, socket) => socket.write(line(response(request, true))));
+  const raceEvents = [];
+  const race = await mock((request, socket) => socket.write(line(response(request, true))), {
+    onDiagnostic: (event, details) => raceEvents.push({ event, details }),
+  });
   try {
     race.client.once('connected', () => race.client.close());
-    await assert.rejects(bounded(race.client.request('getchaintip')), /closed/);
+    await assert.rejects(bounded(race.client.request('getchaintip')), error => error.name === 'AbortError');
+    assert.equal(raceEvents.filter(item => item.event === 'rpc.cancelled').length, 1);
+    assert.equal(raceEvents.some(item => item.event === 'rpc.failed'), false);
   } finally { await race.close(); }
+});
+
+test('local close cancels reads but preserves an already-sent broadcast as an unknown failure', async () => {
+  const events = [];
+  let received;
+  const ready = new Promise(resolve => { received = resolve; });
+  const server = await mock((_request, _socket, requests) => { if (requests.length === 2) received(); }, {
+    onDiagnostic: (event, details) => events.push({ event, details }),
+  });
+  try {
+    const read = assert.rejects(server.client.request('getchaintip'), error => error.name === 'AbortError' && error.code === 'ABORT_ERR');
+    const broadcast = assert.rejects(server.client.request('sendrawtransaction', { transaction_hex: 'ab'.repeat(40) }), error => error.unknownOutcome === true && error.name !== 'AbortError');
+    await bounded(ready);
+    server.client.close();
+    await Promise.all([read, broadcast]);
+    const cancelled = events.filter(item => item.event === 'rpc.cancelled');
+    assert.equal(cancelled.length, 1);
+    assert.equal(cancelled[0].details.method, 'getchaintip');
+    assert.equal(cancelled[0].details.error, undefined);
+    assert.equal(cancelled[0].details.unknownOutcome, false);
+    const failures = events.filter(item => item.event === 'rpc.failed');
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].details.method, 'sendrawtransaction');
+    assert.equal(failures[0].details.unknownOutcome, true);
+    assert.equal(failures[0].details.error.unknownOutcome, true);
+    assert.equal(server.requests.length, 2);
+    assert.equal(server.client.pending.size, 0);
+  } finally { await server.close(); }
+});
+
+test('local close settles an active stream and an unfinished connection as cancellation', async () => {
+  const events = [];
+  let received;
+  const ready = new Promise(resolve => { received = resolve; });
+  const server = await mock((request, socket) => socket.write([
+    response(request, { stream_id: 'cancel-stream' }),
+    note('stream.chunk', { stream_id: 'cancel-stream', sequence: 0, items: { type: 'snapshot' } }),
+  ].map(line).join('')), { onDiagnostic: (event, details) => events.push({ event, details }) });
+  try {
+    const streamed = assert.rejects(server.client.request('getblockbounties', { block_hash: hash }, { onChunk: received }), error => error.name === 'AbortError');
+    await bounded(ready);
+    server.client.close(); await streamed;
+    assert.equal(server.client.streams.size, 0);
+    assert.equal(events.filter(item => item.event === 'rpc.cancelled').length, 1);
+    assert.equal(events.find(item => item.event === 'rpc.cancelled').details.stage, 'stream');
+    assert.equal(events.some(item => item.event === 'rpc.failed'), false);
+  } finally { await server.close(); }
+  const connecting = await mock(() => {});
+  try {
+    const pending = assert.rejects(bounded(connecting.client.connect()), error => error.name === 'AbortError');
+    connecting.client.close(); await pending;
+  } finally { await connecting.close(); }
+});
+
+test('local close cannot reclassify a transport failure that already rejected a request', async () => {
+  const events = [];
+  let received;
+  const ready = new Promise(resolve => { received = resolve; });
+  const server = await mock(() => received(), { onDiagnostic: (event, details) => events.push({ event, details }) });
+  try {
+    const failure = new Error('RPC request timed out.');
+    const pending = assert.rejects(server.client.request('getchaintip'), error => error === failure);
+    await bounded(ready);
+    server.client.failAll(failure); server.client.close(); await pending;
+    assert.equal(events.filter(item => item.event === 'rpc.failed').length, 1);
+    assert.equal(events.find(item => item.event === 'rpc.failed').details.error, failure);
+    assert.equal(events.some(item => item.event === 'rpc.cancelled'), false);
+  } finally { await server.close(); }
 });
 
 test('diagnostic callbacks cannot fail requests or replace RPC errors', async () => {

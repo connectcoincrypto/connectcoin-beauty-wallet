@@ -7,6 +7,9 @@ import secrets
 import socket
 import time
 from dataclasses import dataclass
+from threading import Event, Lock
+from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any
 
 from cryptography.exceptions import InvalidTag
@@ -53,6 +56,56 @@ MAX_CAPTURED_HANDSHAKE = 64 * 1024
 
 class TLSGenerationError(P2CError):
     """A server did not complete the narrow TLS 1.3 profile required by P2C."""
+
+
+class CaptureCancelled(TLSGenerationError):
+    """The wallet cancelled this individual connection attempt."""
+
+
+class CaptureControl:
+    """Cancellation owns the socket, so blocked connect/receive can be interrupted."""
+
+    def __init__(self) -> None:
+        self._event = Event()
+        self._lock = Lock()
+        self._socket: socket.socket | None = None
+
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.detach()
+
+    def begin(self, connection: socket.socket, on_started: Callable[[], None] | None) -> None:
+        with self._lock:
+            if self.cancelled():
+                raise CaptureCancelled("TLS capture cancelled")
+            self._socket = connection
+            if on_started is not None:
+                on_started()
+
+    def bind(self, connection: socket.socket) -> None:
+        self.begin(connection, None)
+
+    def detach(self) -> None:
+        with self._lock:
+            self._socket = None
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._event.set()
+            if self._socket is not None:
+                try:
+                    self._socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    self._socket.close()
+                except OSError:
+                    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,10 +421,15 @@ def capture_tls13_proof(
     *,
     signature_algorithms_mask: int,
     timeout: float = 10.0,
+    control: CaptureControl | None = None,
+    on_started: Callable[[], None] | None = None,
+    before_start: Callable[[], None] | None = None,
 ) -> TLSProofMessages:
     validate_signature_algorithms_mask(signature_algorithms_mask)
     if not math.isfinite(timeout) or timeout <= 0:
         raise TLSGenerationError("connection timeout must be finite and positive")
+    if control is not None and control.cancelled():
+        raise CaptureCancelled("TLS capture cancelled")
     private_key = x25519.X25519PrivateKey.generate()
     public_key = private_key.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
@@ -386,7 +444,17 @@ def capture_tls13_proof(
     )
     deadline = time.monotonic() + timeout
 
-    with socket.socket(endpoint.family, endpoint.socket_type, endpoint.protocol) as connection:
+    with socket.socket(endpoint.family, endpoint.socket_type, endpoint.protocol) as connection, (control if control is not None else nullcontext()):
+        if control is not None:
+            control.bind(connection)
+        if before_start is not None:
+            before_start()
+        # Queued/rate-limited time is not part of a TCP/TLS attempt deadline.
+        deadline = time.monotonic() + timeout
+        if control is not None:
+            control.begin(connection, on_started)
+        elif on_started is not None:
+            on_started()
         connection.settimeout(_remaining_timeout(deadline))
         connection.connect(endpoint.address)
         connection.settimeout(_remaining_timeout(deadline))

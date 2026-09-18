@@ -8,6 +8,22 @@ targets, signature policies and the production-root pin are rejected.
 The custom CA exception exists only in the test's direct verifier call, not
 in `claims_bridge.py` or the wallet's production worker.
 
+Offline telemetry tests cover completion order under concurrency, rolling
+100-entry snapshots and monotonic completion counts, successful captures that
+miss the work target or fail later certificate verification, queued cancellation,
+DNS failure, and in-flight completions after a winning proof. A 100,000-attempt
+simulation verifies the once-per-second output limit and bounded NDJSON size.
+These scheduler tests mock public capture calls and send no public traffic.
+
+Persistent protocol-3 tests cover startup/shutdown, strict framing/IDs/options,
+DNS caching/expiry and endpoint rotation, global start-rate/concurrency limits,
+per-attempt cancellation, completion-before-verification ordering, exact uint64
+successful-capture budgets and their strict two-expected-value boundary, and
+bounded pending/DNS/counter caches. A 1,100-capture simulation verifies that one
+executor survives across all bounties without a 1,000-attempt lifetime cap. A
+second loopback fixture verifies that cancellation interrupts a real blocked
+socket receive rather than waiting for the handshake deadline.
+
 The independent native Core regtest checks Beauty's typed transaction wire
 encoding, native Schnorr payments, P2C funding and the spending transaction's
 exact challenge. Wallet service tests exercise complete bounty snapshots,

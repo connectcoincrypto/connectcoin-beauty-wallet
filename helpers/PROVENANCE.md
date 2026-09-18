@@ -6,7 +6,15 @@ commit `ad35a58a0c59ed985b3566d352053773269e76d2` (0.3.0). The CLI and tests
 are not required at runtime. The upstream license is retained alongside it.
 Beauty Wallet's local hardening in `generator.py` also rejects multicast,
 reserved and IPv6 translation/tunnel destinations: `is_global` by itself is
-not a sufficient SSRF boundary. Protocol encoding and verification are unchanged.
+not a sufficient SSRF boundary. Local patches also add independently cancellable
+capture sockets and completion telemetry. Capture success means completion
+through CertificateVerify before certificate verification and the hash-target
+test, as in Core. The protocol-3 desktop service emits a capture event before
+verification, then one terminal result per request. The main process retains
+the last 100 completed observations per domain and exact signature-policy mask.
+DNS failures and cancelled queued attempts do not create TLS observations.
+The legacy one-shot generator retains bounded snapshots for development tooling;
+it is not the desktop scheduling path. Proof encoding and verification are unchanged.
 
 `p2c_roots_v1.pem` is the immutable Mozilla-derived consensus trust bundle from
 ConnectCoin Core. Its SHA-256 is
@@ -32,12 +40,22 @@ signature-mask, challenge, and CertificateVerify verification. This independent
 X.509 implementation can reject some encodings accepted by Core; the node's
 consensus validation remains authoritative.
 
-Limits are finite: one bounty job at a time, default 100 starts/sec and 100
-simultaneous connections, maximum 256 of either, 10-second socket deadlines,
-180 seconds and 1,000 attempts per job. Automatic Claims are off by default;
-locking or stopping the wallet terminates the helper. The engine never starts
-another worker until the old one exits. There is no private-network or
-unpinned-root bypass in the bridge.
+The desktop uses one persistent helper/executor shared across all bounties,
+defaulting to 100 starts/sec and 100 simultaneous TLS connections (maximum 256
+of either). Each connection has a 10-second deadline; there is no 1,000-attempt
+or 180-second batch limit. DNS resolution uses two bounded slots, a 60-second
+positive cache and 2-second negative cache. The cache holds at most 4,096 domains
+with 32 pinned endpoints each, and the total pending-request limit is 512.
+The helper independently enforces Core's exact successful-capture budget:
+stop starting attempts once `successes * (target + 1) > 2^257`, including successful
+captures whose hash misses. Already in-flight captures may still finish. A
+bounded 1,024-entry counter cache never evicts active/queued bounties; the main
+process supplies its retained uint64 counter on every request. No private-network
+or unpinned-root bypass is available. Automatic Claims remain opt-in. Individual
+cancellation closes only that attempt's socket; wallet lock/stop terminates the
+entire helper. OS DNS calls cannot be interrupted by Python, so process termination
+remains the hard shutdown bound for a stuck resolver. Input/output frames are
+limited to 16/160 KiB and concurrent output is serialized.
 
 For development, run `node scripts/setup-claims.mjs`. It creates a private
 Python virtual environment and installs the pinned provider. Python 3.11+

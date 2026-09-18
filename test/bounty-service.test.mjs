@@ -215,7 +215,7 @@ test('real discovery of thousands of mostly spent bounties publishes bounded sna
     await service.syncBounties();
     assert.equal(service.claimOutpoints.size, 3000);
     assert.equal(service.engine.queue.size, 30);
-    assert.equal(notifications, 2, 'initial reset and thirty new queue entries; no notifications for 2,970 absent spent entries');
+    assert.equal(notifications, 3, 'initial pool suspension, reset and thirty new queue entries; no notifications for 2,970 absent spent entries');
     assert.equal(snapshots, 1, 'snapshot construction is coalesced before serialization');
     assert.equal(timers.size, 1);
     flush();
@@ -224,7 +224,7 @@ test('real discovery of thousands of mostly spent bounties publishes bounded sna
     assert.equal(states.at(-1).claims.scanning, false);
     const reads = f.calls.filter(call => call.method === 'getblockbounties').length;
     for (let i = 0; i < 20; i++) await service.syncBounties();
-    assert.equal(notifications, 2, 'repeated cached scans neither remove absent entries nor re-enqueue unchanged entries');
+    assert.equal(notifications, 3, 'repeated cached scans neither remove absent entries nor re-enqueue unchanged entries');
     assert.equal(service.engine.queue.size, 30);
     assert.equal(f.calls.filter(call => call.method === 'getblockbounties').length, reads);
     assert.equal(snapshots, 2);

@@ -9,6 +9,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { GENESIS } from '../src/core/config.mjs';
 import { createRequire } from 'node:module';
+import { waitForUiCondition } from './ui-wait.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const profile = await mkdtemp(path.join(tmpdir(), 'beauty-wallet-ui-test-'));
@@ -72,7 +73,7 @@ async function waitForScheme(dark) {
 async function selectTheme(theme, { ui = false } = {}) {
   if (ui) await page.locator('#theme-preference').selectOption(theme);
   else await page.evaluate(value => window.beauty.invoke('setTheme', { theme: value }), theme);
-  await page.waitForFunction(async value => (await window.beauty.invoke('getState')).config.theme === value && document.documentElement.dataset.theme === value && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', theme);
+  await waitForUiCondition(page, async value => (await window.beauty.invoke('getState')).config.theme === value && document.documentElement.dataset.theme === value && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', theme, { message: 'The saved appearance and idle renderer must match the requested theme.' });
   // Observed Electron runs sometimes expose the new config/CSS just before the
   // native getter agrees. Verify convergence, without assuming its cause or
   // relaxing the requested-value assertion after this bounded wait.
@@ -90,8 +91,9 @@ async function selectTheme(theme, { ui = false } = {}) {
 async function toggleDeveloperMode(enabled) {
   await page.locator('[data-view="settings"]').first().click();
   await page.getByRole('switch', { name: 'Developer Mode', exact: true }).click();
-  await page.waitForFunction(async value => (await window.beauty.invoke('getState')).config.developerMode === value && document.querySelector('#developer-mode')?.getAttribute('aria-checked') === String(value) && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', enabled);
-  assert.equal(JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).developerMode, enabled);
+  await waitForUiCondition(page, async value => (await window.beauty.invoke('getState')).config.developerMode === value && document.querySelector('#developer-mode')?.getAttribute('aria-checked') === String(value) && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', enabled, { message: 'The saved Developer Mode and idle switch must match the requested boolean.' });
+  const persisted = JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).developerMode;
+  assert.equal(persisted, enabled, `Developer Mode persistence mismatch (expected=${enabled}, persisted=${typeof persisted === 'boolean' ? persisted : typeof persisted}).`);
 }
 
 let presentationSequence = 0;
@@ -185,7 +187,7 @@ try {
   for (const index of indexes) await page.locator(`#check-${index}`).fill(seed[index]);
   await page.getByRole('button', { name: 'Open my wallet' }).click();
   await page.getByRole('heading', { name: 'A little more connected.' }).waitFor();
-  await page.waitForFunction(async () => {
+  await waitForUiCondition(page, async () => {
     const state = await window.beauty.invoke('getState');
     return state.network.status === 'online' && !state.busy && state.wallet?.balance?.available === '0';
   });
@@ -353,7 +355,7 @@ try {
   // Avoid Playwright action dumps: they could contain a generated backup word.
   const sourceLine = /test-ui\.mjs:(\d+):\d+/.exec(String(error.stack ?? ''))?.[1];
   console.error(`UI smoke test failed during ${stage} (${error.name ?? 'Error'}${sourceLine ? `, test line ${sourceLine}` : ''}). No recovery words were logged. Temporary profile preserved: ${profile}`);
-  if (error.code === 'ERR_ASSERTION' && (stage === 'appearance settings preserve wallet and drafts' || String(error.message).startsWith('Native appearance must match'))) console.error(String(error.message).slice(0, 500));
+  if (error.code === 'ERR_ASSERTION' && (stage === 'appearance settings preserve wallet and drafts' || /^(?:Native appearance must match|Developer Mode persistence mismatch)/.test(String(error.message)))) console.error(String(error.message).slice(0, 500));
   process.exitCode = 1;
 } finally {
   seed.fill(''); seed = [];

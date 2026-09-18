@@ -2,6 +2,7 @@ import { access } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ConnectionPool } from '../src/core/claim-pool.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const helper = resolve(root, 'helpers/bin/beauty-claims', process.platform === 'win32' ? 'beauty-claims.exe' : 'beauty-claims');
@@ -17,4 +18,10 @@ await new Promise((accept, reject) => {
   child.once('error', reject);
   child.once('exit', code => code === 0 ? accept() : reject(new Error('Bundled Automatic Claims helper failed its self-test.')));
 });
-console.log('Native helper and desktop assets verified for packaging.');
+// A legacy one-shot executable can pass its own self-test but still be
+// incompatible with the wallet. Exercise the real protocol-3 handshake too;
+// this sends no DNS requests, TLS connections, RPC calls or wallet data.
+const pool = new ConnectionPool({ helper: { command: helper, args: [] } });
+try { await pool.start({}); }
+finally { await pool.close(); }
+console.log('Native protocol-3 helper and desktop assets verified for packaging.');

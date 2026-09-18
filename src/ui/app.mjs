@@ -106,7 +106,8 @@ function acceptState(next, { background = false } = {}) {
   const previous = state.phase;
   const importantChange = next.error !== state.error ||
     (state.claims?.enabled && !next.claims?.enabled) ||
-    (next.claims?.lastError && !next.claims.lastErrorDiagnostic && next.claims.lastError !== state.claims?.lastError);
+    (next.claims?.lastError && !next.claims.lastErrorDiagnostic &&
+      !next.claims.lastErrorTransient && next.claims.lastError !== state.claims?.lastError);
   const securityChanged = state.securityEpoch !== undefined && next.securityEpoch !== state.securityEpoch;
   const replacementEnded = Boolean(replacement && (next.replacementActive !== true || next.phase !== 'locked' || securityChanged));
   const clearSetup = Boolean(setup && next.setupActive === false) || securityChanged || replacementEnded;

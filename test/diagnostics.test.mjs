@@ -23,6 +23,7 @@ test('helper DNS, blocked destination and target exhaustion retain safe distinct
     ['domain resolved to no permitted TCP addresses: private-canary', 'destination-blocked'],
     ['no proof met the target in 1000 attempts; last error: private-canary', 'target-not-met'],
     ['generation timed out after 1000 completed attempts', 'timeout'],
+    ['TLS capture or proof validation failed', 'proof-failed'],
   ]) {
     const error = diagnosticError(new Error(message));
     assert.equal(error.category, category);
@@ -100,6 +101,24 @@ test('successful claims do not evict recent current-session failures', async t =
   assert.deepEqual(next.snapshot().recent, []);
   assert.equal(next.snapshot().errors, 0);
   assert.equal((await rows(next.snapshot().file))[0].event, 'claim.failed');
+});
+
+test('intentional RPC and refresh cancellations remain on disk without increasing errors', async t => {
+  const directory = await fixture(t);
+  const log = new DiagnosticLog({ directory });
+  log.record('rpc.cancelled', { stage: 'request', method: 'getaddresshistory', durationMs: 3, unknownOutcome: false });
+  log.record('wallet.refresh_cancelled', { stage: 'refresh', durationMs: 5 });
+  log.record('rpc.failed', { stage: 'request', method: 'sendrawtransaction', unknownOutcome: true,
+    error: Object.assign(new Error('Broadcast outcome is unknown.'), { unknownOutcome: true }) });
+  await log.flush();
+  const stored = await rows(log.snapshot().file);
+  assert.deepEqual(stored.map(row => row.event), ['rpc.cancelled', 'wallet.refresh_cancelled', 'rpc.failed']);
+  assert.equal(stored[0].details.error, undefined);
+  assert.equal(stored[1].details.error, undefined);
+  assert.equal(log.snapshot().errors, 1);
+  assert.equal(log.snapshot().dropped, 0);
+  assert.deepEqual(log.snapshot().recent.map(row => row.event), ['rpc.failed']);
+  assert.equal(stored[2].details.error.category, 'broadcast-unknown');
 });
 
 test('strict detail allowlists exclude secrets, payloads, arbitrary strings and numeric overflow', async t => {

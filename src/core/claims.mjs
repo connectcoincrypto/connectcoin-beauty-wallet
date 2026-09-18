@@ -3,11 +3,14 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
+import { validateAttemptStats } from './claim-priority.mjs';
 
 const BASE = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const CONTEXT_KEYS = ['domain', 'txid', 'input_index', 'connection_work_target', 'root_certificates_version', 'signature_algorithms_mask', 'validation_time'];
 const HASH = /^[0-9a-f]{64}$/;
 const DOMAIN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+// Legacy one-shot development bridge only. The wallet's continuous scheduler
+// uses CONNECTION_DEFAULTS in claim-pool.mjs: no batch timeout/attempt limit.
 export const DEFAULT_CLAIM_OPTIONS = Object.freeze({ connectionsPerSecond: 100, concurrency: 100, overallTimeout: 180, maxAttempts: 1000 });
 
 // Only explicit API-recognized rejections are recoverable. Already-known (-27),
@@ -62,7 +65,7 @@ export function getClaimsHelper({ basePath = BASE, resourcesPath } = {}) {
   return null;
 }
 
-/** Main-process-only subprocess bridge. No key material is serialized across it. */
+/** Legacy one-shot tooling bridge, not used by the desktop claims engine. No keys cross it. */
 export function createProofRunner({ helper, basePath = BASE, resourcesPath, spawnProcess = spawn, onDiagnostic = () => {} } = {}) {
   return async function generateProof(contextInput, { signal, options, onProgress = () => {} } = {}) {
     const context = validateClaimContext(contextInput);
@@ -81,6 +84,7 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
       let failure;
       let settled = false;
       let exitCode;
+      let completedAttempts = 0;
       const stop = (error) => {
         failure ??= error;
         // Terminate the sole helper process, including its worker threads/sockets.
@@ -107,8 +111,15 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
         if (message.type === 'progress') {
           integer(message.attempts, 0, limits.maxAttempts, 'progress attempts');
           if (typeof message.elapsed !== 'number' || !Number.isFinite(message.elapsed) || message.elapsed < 0) throw new Error('Invalid helper progress');
-          try { onProgress({ attempts: message.attempts, elapsed: message.elapsed }); } catch { /* UI callbacks cannot compromise cancellation. */ }
+          if (message.attemptStats === undefined) throw new Error('Claims helper lacks TLS statistics. Update the app or run npm run build:claims.');
+          validateAttemptStats(message.attemptStats, limits.maxAttempts);
+          if (message.attemptStats.completed < completedAttempts || message.attemptStats.completed !== message.attempts) throw new Error('Invalid helper attempt sequence');
+          completedAttempts = message.attemptStats.completed;
+          try { onProgress({ attempts: message.attempts, elapsed: message.elapsed, attemptStats: message.attemptStats }); } catch { /* UI callbacks cannot compromise cancellation. */ }
         } else if (message.type === 'result') {
+          if (!completedAttempts) throw new Error('Claims helper lacks TLS statistics. Update the app or run npm run build:claims.');
+          integer(message.attempts, 1, limits.maxAttempts, 'proof attempts');
+          if (message.attempts !== completedAttempts) throw new Error('Invalid helper final attempt sequence');
           const returnedContext = validateClaimContext(message.context);
           if (CONTEXT_KEYS.some((key) => returnedContext[key] !== context[key]) || message.verified !== true) throw new Error('Proof does not match the prepared claim');
           if (typeof message.proof !== 'string' || !/^02(?:[0-9a-f]{2})+$/.test(message.proof) || message.proof.length > 131072) throw new Error('Invalid proof encoding');
@@ -127,8 +138,9 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
         child.stdout.on('data', (chunk) => {
           if (failure || settled) return;
           outputBytes += chunk.length;
-          // At most 600 throttled progress messages + one 64-KiB proof, never an unbounded log.
-          if (outputBytes > 512 * 1024) { stop(new Error('Claims helper output limit exceeded')); return; }
+          // Throttled progress carries a bounded last-100 TLS sample window;
+          // allow 600 seconds plus the final snapshot and a 64-KiB proof.
+          if (outputBytes > 4 * 1024 * 1024) { stop(new Error('Claims helper output limit exceeded')); return; }
           output += chunk.toString('utf8');
           try {
             let end;
@@ -162,174 +174,4 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
   };
 }
 
-/** Opt-in scheduler; prepares and verifies one immutable claim transaction per job. */
-export class ClaimsEngine {
-  constructor({ prepare, submit, isUnlocked, generateProof = createProofRunner(), onState = () => {}, onDiagnostic = () => {}, options = {}, retryDelayMs = 30000, maxQueue = 20000 }) {
-    if (![prepare, submit, isUnlocked, generateProof, onState].every((fn) => typeof fn === 'function')) throw new Error('Claim callbacks are required');
-    this.prepare = prepare;
-    this.submit = submit;
-    this.isUnlocked = isUnlocked;
-    this.generateProof = generateProof;
-    this.onState = onState;
-    this.onDiagnostic = onDiagnostic;
-    this.nextDiagnosticId = 0;
-    this.options = validateClaimOptions(options);
-    this.retryDelayMs = integer(retryDelayMs, 1, 300000, 'retry delay');
-    this.maxQueue = integer(maxQueue, 1, 20000, 'claim queue size');
-    this.queue = new Map();
-    this.completed = new Set();
-    this.enabled = false;
-    this.running = null;
-    this.controller = null;
-    this.timer = null;
-    this.state = { enabled: false, status: 'off', queued: 0, completed: 0, attempts: 0, lastError: null, lastErrorDiagnostic: false };
-  }
-  snapshot() { return { ...this.state, enabled: this.enabled, queued: this.queue.size, options: { ...this.options } }; }
-  notify(patch = {}) {
-    if (Object.hasOwn(patch, 'lastError') && patch.lastError === null) patch = { ...patch, lastErrorDiagnostic: false };
-    this.state = { ...this.state, ...patch };
-    try { this.onState(this.snapshot()); } catch { /* Presentation failure must not interrupt cleanup. */ }
-  }
-  setOptions(options) {
-    if (this.enabled || this.running) throw new Error('Stop Automatic Claims before changing connection limits');
-    this.options = validateClaimOptions(options);
-    this.notify();
-  }
-  enqueue(bounties) {
-    if (!Array.isArray(bounties)) throw new Error('Bounty list required');
-    let count = 0;
-    for (const bounty of bounties) {
-      if (!bounty || typeof bounty.txid !== 'string' || !HASH.test(bounty.txid) || !Number.isInteger(bounty.vout) || bounty.vout < 0 || bounty.vout > 0xffffffff || bounty.status !== 'available') continue;
-      const key = `${bounty.txid}:${bounty.vout}`;
-      if (this.completed.has(key) || this.queue.has(key)) continue;
-      if (this.queue.size >= this.maxQueue) break;
-      // Discovery is untrusted; prepare must authenticate amount/policy against the funding TX.
-      this.queue.set(key, { bounty: structuredClone(bounty), due: 0, failures: 0, diagnosticId: ++this.nextDiagnosticId });
-      count++;
-    }
-    if (count) this.notify();
-    this.kick();
-    return count;
-  }
-  remove(txid, vout) {
-    const key = `${txid}:${vout}`;
-    const removed = this.queue.delete(key);
-    const abortActive = this.activeKey === key && this.controller && !this.controller.signal.aborted;
-    if (abortActive) this.controller.abort();
-    if (removed || abortActive) this.notify();
-  }
-  retire(txid, vout) {
-    const key = `${txid}:${vout}`, job = this.queue.get(key);
-    if (!job || job.retired) return;
-    // Leaving discovery is not consensus expiry. Let the current attempt finish,
-    // but do not start or retry work we can no longer monitor in that window.
-    if (job && this.activeKey === key) job.retired = true;
-    else this.queue.delete(key);
-    this.notify();
-  }
-  clear() {
-    this.queue.clear();
-    this.completed.clear();
-    this.controller?.abort();
-    this.notify({ completed: 0 });
-  }
-  start() {
-    if (!this.isUnlocked()) throw new Error('Unlock the wallet before starting Automatic Claims');
-    if (this.running && !this.enabled) throw new Error('Wait for the previous claims worker to stop');
-    this.enabled = true;
-    report(this.onDiagnostic, 'claims.started', { stage: 'lifecycle', enabled: true, queued: this.queue.size });
-    this.notify({ status: 'waiting', lastError: null });
-    this.kick();
-  }
-  async stop() {
-    const wasEnabled = this.enabled;
-    this.enabled = false;
-    if (wasEnabled) report(this.onDiagnostic, 'claims.stopped', { stage: 'lifecycle', enabled: false, queued: this.queue.size, completed: this.state.completed });
-    this.paused = false;
-    clearTimeout(this.timer);
-    this.timer = null;
-    this.controller?.abort();
-    this.notify({ status: 'off', domain: null });
-    await this.running;
-  }
-  async suspend() {
-    this.paused = true;
-    clearTimeout(this.timer);
-    this.timer = null;
-    this.controller?.abort();
-    await this.running;
-  }
-  resume() { this.paused = false; this.kick(); }
-  kick() {
-    if (!this.enabled || this.running || this.paused) return;
-    clearTimeout(this.timer);
-    this.timer = null;
-    if (!this.isUnlocked()) {
-      this.enabled = false;
-      report(this.onDiagnostic, 'claims.stopped', { stage: 'lifecycle', enabled: false, queued: this.queue.size, completed: this.state.completed });
-      this.notify({ status: 'locked' }); return;
-    }
-    const now = Date.now();
-    const next = [...this.queue].find(([, job]) => job.due <= now);
-    if (!next) {
-      this.notify({ status: 'waiting' });
-      if (this.queue.size) {
-        let earliest = Infinity;
-        for (const job of this.queue.values()) earliest = Math.min(earliest, job.due);
-        this.timer = setTimeout(() => this.kick(), Math.max(1, earliest - now));
-        this.timer.unref?.();
-      }
-      return;
-    }
-    const [key, job] = next;
-    this.activeKey = key;
-    this.controller = new AbortController();
-    const signal = this.controller.signal;
-    const started = performance.now();
-    let stage = 'prepare';
-    let attempts = 0;
-    const details = () => ({ stage, claimId: job.diagnosticId, attempts, queued: this.queue.size,
-      completed: this.state.completed, enabled: this.enabled, durationMs: Math.round(performance.now() - started) });
-    // Deferring prevents synchronous callback throws from racing assignment of running.
-    this.running = Promise.resolve().then(async () => {
-      const eligible = () => this.enabled && this.isUnlocked() && !signal.aborted && this.queue.get(key) === job;
-      if (!eligible()) throw aborted();
-      this.notify({ status: 'preparing', domain: job.bounty.domain, attempts: 0, lastError: null });
-      report(this.onDiagnostic, 'claim.started', details());
-      const prepared = await this.prepare(structuredClone(job.bounty), { signal });
-      if (!eligible()) throw aborted();
-      const context = validateClaimContext(prepared.context);
-      stage = 'proof';
-      this.notify({ status: 'searching', domain: context.domain });
-      const proof = await this.generateProof(context, { signal, options: this.options, onProgress: (progress) => {
-        if (eligible()) { attempts = progress.attempts; this.notify({ attempts }); }
-      } });
-      if (!eligible()) throw aborted();
-      stage = 'submit';
-      this.notify({ status: 'submitting' });
-      const receipt = await this.submit(prepared, proof, { signal });
-      // A broadcast already handed to the kernel cannot be recalled by locking.
-      this.completed.add(key);
-      if (this.completed.size > this.maxQueue) this.completed.delete(this.completed.values().next().value);
-      this.queue.delete(key);
-      report(this.onDiagnostic, 'claim.succeeded', { ...details(), completed: this.state.completed + 1 });
-      this.notify({ status: this.enabled ? 'claimed' : 'off', completed: this.state.completed + 1, lastClaim: typeof receipt === 'string' ? receipt : receipt?.txid ?? context.txid });
-    }).catch((error) => {
-      if (error.name !== 'AbortError') {
-        job.failures = Math.min(job.failures + 1, 8);
-        job.due = Date.now() + Math.min(this.retryDelayMs * 2 ** (job.failures - 1), 300000);
-        report(this.onDiagnostic, 'claim.failed', { ...details(), error, failures: job.failures,
-          retryDelayMs: Math.max(0, job.due - Date.now()) });
-        this.notify({ status: this.enabled ? 'retrying' : 'off', lastError: String(error.message || error).slice(0, 500),
-          lastErrorDiagnostic: stage === 'submit' && isKnownClaimRejection(error) });
-      } else report(this.onDiagnostic, 'claim.cancelled', details());
-    }).finally(() => {
-      if (job.retired && this.queue.get(key) === job) this.queue.delete(key);
-      this.running = null;
-      this.controller = null;
-      this.activeKey = null;
-      this.notify();
-      this.kick();
-    });
-  }
-}
+export { ClaimsEngine } from './claims-engine.mjs';

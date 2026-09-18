@@ -3,11 +3,14 @@ import { mkdir, lstat, open, rename, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const EVENTS = new Set([
-  'wallet.started', 'wallet.closed', 'wallet.refresh_failed', 'wallet.discovery_failed',
-  'claims.started', 'claims.stopped', 'claim.started', 'claim.succeeded', 'claim.failed',
-  'claim.cancelled', 'rpc.connected', 'rpc.disconnected', 'rpc.failed', 'rpc.slow', 'helper.failed',
+  'wallet.started', 'wallet.closed', 'wallet.refresh_failed', 'wallet.refresh_cancelled', 'wallet.discovery_failed', 'wallet.discovery_cancelled',
+  'claims.started', 'claims.stopped', 'claims.suspended', 'claims.resumed', 'claims.progress', 'claims.failed',
+  'claim.started', 'claim.succeeded', 'claim.failed',
+  'claim.cancelled', 'rpc.connected', 'rpc.disconnected', 'rpc.failed', 'rpc.cancelled', 'rpc.slow', 'helper.failed',
 ]);
-const STAGES = new Set(['prepare', 'proof', 'submit', 'refresh', 'discovery', 'connect', 'request', 'stream', 'lifecycle']);
+const STAGES = new Set(['prepare', 'dns', 'proof', 'submit', 'refresh', 'discovery', 'connect', 'request', 'stream', 'lifecycle']);
+const REASONS = new Set(['stop', 'locked', 'suspend', 'clear', 'unavailable', 'window-exit', 'sibling-proof', 'fatal', 'other']);
+const DURATION_SCOPES = new Set(['stage', 'run']);
 const METHODS = new Set([
   'getchaintip', 'getrecentblockhashes', 'getblockbounties', 'getaddressbalance',
   'getaddresshistory', 'getaddressutxos', 'gettransaction', 'sendrawtransaction',
@@ -79,7 +82,7 @@ function describeError(error, includeCause) {
   else if (['ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'EPIPE', 'ERR_SOCKET_CLOSED'].includes(code)) category = 'network';
   else if (['EMFILE', 'ENFILE', 'ENOMEM', 'ENOBUFS'].includes(code)) category = 'resource-limit';
   else if (['EACCES', 'EPERM', 'ENOENT', 'ENOSPC', 'EIO', 'EROFS'].includes(code)) category = 'storage';
-  else if (/^DNS resolution failed for /i.test(message)) category = 'dns';
+  else if (/^DNS resolution failed for /i.test(message) || /^Domain resolution failed\.?$/i.test(message)) category = 'dns';
   else if (/^domain resolved to no permitted TCP addresses/i.test(message)) category = 'destination-blocked';
   else if (/^no proof met the target in \d+ attempts/i.test(message)) category = 'target-not-met';
   else if (/helper is not installed|Install the Automatic Claims helper first/i.test(message)) category = 'helper-missing';
@@ -90,7 +93,7 @@ function describeError(error, includeCause) {
   else if (/node rejected (?:this claim|the transaction)/i.test(message)) category = 'node-rejected';
   else if (/helper (?:could not start|input failed)/i.test(message)) category = 'helper-failed';
   else if (/Malformed claims helper|Unknown claims helper|Invalid helper progress|Unexpected output after claims proof/i.test(message)) category = 'helper-response';
-  else if (/TLS proof|without a verified proof|Invalid proof encoding|Proof does not match|proof generation failed/i.test(message)) category = 'proof-failed';
+  else if (/TLS proof|without a verified proof|Invalid proof encoding|Proof does not match|proof generation failed|^TLS capture or proof validation failed$/i.test(message)) category = 'proof-failed';
   else if (/resource limit|(?:output|frame|diagnostic|safety|buffer) limit|capacity reached/i.test(message)) category = 'resource-limit';
   else if (/Wallet locked or changed|Unlock the wallet/i.test(message)) category = 'wallet-locked';
   else if (/RPC connection (?:is closed|closed|changed)|RPC client (?:is closed|closed)|Connection to the RPC server was lost|Cannot connect to RPC/i.test(message)) category = 'network';
@@ -107,17 +110,27 @@ const NUMBERS = Object.freeze({
   completed: [0, 1000000000], failures: [0, 1000000000], retryDelayMs: [0, 86400000],
   durationMs: [0, 86400000], height: [0, 0xffffffff], bytes: [0, 1073741824],
   stderrBytes: [0, 1073741824], exitCode: [-2147483648, 2147483647],
+  runId: [0, Number.MAX_SAFE_INTEGER], operationsStarted: [0, 1000000000], operationsCompleted: [0, 1000000000],
+  operationsFailed: [0, 1000000000], operationsCancelled: [0, 1000000000], captures: [0, 1000000000], suppressedEvents: [0, 1000000000],
+  prepareActive: [0, 4], dnsActive: [0, 2], captureActive: [0, 256], submitActive: [0, 4],
+  activeMaxDurationMs: [0, Number.MAX_SAFE_INTEGER], durationTotalMs: [0, Number.MAX_SAFE_INTEGER], durationMaxMs: [0, Number.MAX_SAFE_INTEGER],
+  cancelledStop: [0, 1000000000], cancelledLocked: [0, 1000000000], cancelledSuspend: [0, 1000000000],
+  cancelledClear: [0, 1000000000], cancelledUnavailable: [0, 1000000000], cancelledWindowExit: [0, 1000000000],
+  cancelledSiblingProof: [0, 1000000000], cancelledFatal: [0, 1000000000], cancelledOther: [0, 1000000000],
 });
 function sanitize(details) {
   const clean = {};
   const stage = own(details, 'stage'), method = own(details, 'method');
   if (STAGES.has(stage)) clean.stage = stage;
   if (METHODS.has(method)) clean.method = method;
+  const reason = own(details, 'reason'), durationScope = own(details, 'durationScope');
+  if (REASONS.has(reason)) clean.reason = reason;
+  if (DURATION_SCOPES.has(durationScope)) clean.durationScope = durationScope;
   for (const [key, [minimum, maximum]] of Object.entries(NUMBERS)) {
     const value = own(details, key);
     if (Number.isFinite(value) && value >= minimum && value <= maximum && (key === 'durationMs' || Number.isSafeInteger(value))) clean[key] = value;
   }
-  for (const key of ['enabled', 'unknownOutcome']) {
+  for (const key of ['enabled', 'paused', 'unknownOutcome']) {
     const value = own(details, key);
     if (typeof value === 'boolean') clean[key] = value;
   }

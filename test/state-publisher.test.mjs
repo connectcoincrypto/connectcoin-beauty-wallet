@@ -99,6 +99,34 @@ test('one thousand claim updates coalesce before WalletService constructs full s
   await service.close();
 });
 
+test('transient failure and retry bursts coalesce without delaying a fatal error', async () => {
+  const fixture = serviceFixture(), { service, scheduler, states } = fixture;
+  service.engine.enabled = true; service.engine.notify({ status: 'searching' });
+  const job = { diagnosticId: 1, failures: 0 };
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    service.engine.jobError(job, new Error('TLS capture or proof validation failed'), 'proof', false);
+    service.engine.notify({ status: 'waiting' });
+    service.engine.notify({ status: 'submitting' });
+    service.engine.notify({ status: 'searching', lastError: null });
+  }
+  assert.equal(fixture.snapshots, 1, 'failed attempts must not bypass the progress throttle');
+  service.engine.jobError(job, new Error('TLS capture or proof validation failed'), 'proof', false);
+  scheduler.advance(200);
+  assert.equal(fixture.snapshots, 2);
+  assert.equal(states.at(-1).claims.status, 'retrying');
+  assert.equal(states.at(-1).claims.lastError, 'TLS capture or proof validation failed', 'a sustained retry warning remains available');
+  assert.equal(states.at(-1).claims.lastErrorTransient, true);
+  service.engine.fatal(Object.assign(new Error('Broadcast outcome unknown.'), { unknownOutcome: true }));
+  assert.equal(states.at(-1).claims.enabled, false);
+  assert.equal(states.at(-1).claims.lastError, 'Broadcast outcome unknown.');
+  assert.equal(states.at(-1).claims.lastErrorTransient, false);
+  assert.equal(states.at(-1).claims.lastErrorDiagnostic, false);
+  scheduler.advance(200);
+  assert.equal(states.at(-1).claims.enabled, false);
+  assert.equal(states.at(-1).claims.lastError, 'Broadcast outcome unknown.');
+  await service.close();
+});
+
 test('lock is immediate despite progress backlog, and close releases the final timer', async () => {
   const { service, scheduler, states } = serviceFixture();
   service.emitState();

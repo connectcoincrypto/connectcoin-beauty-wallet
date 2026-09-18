@@ -52,6 +52,26 @@ function lossError(request, reason) {
   return reason;
 }
 function clearRequest(request) { clearTimeout(request.timer); clearTimeout(request.deadlineTimer); }
+function closedError() {
+  return Object.assign(new Error('RPC client closed.'), { name: 'AbortError', code: 'ABORT_ERR' });
+}
+function cancelledError() {
+  return Object.assign(new Error('RPC request cancelled before transmission.'), { name: 'AbortError', code: 'ABORT_ERR' });
+}
+function isLocalCancellation(error) {
+  return error instanceof Error && error.name === 'AbortError' && error.code === 'ABORT_ERR' && !error.unknownOutcome;
+}
+function waitForConnection(promise, signal) {
+  // Connecting is shared. Only abandon this wait; destroying the socket would
+  // also cancel unrelated requests (including broadcasts already in flight).
+  return new Promise((resolve, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); reject(cancelledError()); };
+    promise.then(value => { signal.removeEventListener('abort', abort); resolve(value); },
+      error => { signal.removeEventListener('abort', abort); reject(error); });
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
 
 /** A bounded, plaintext, native TCP client. No wallet secrets cross this class. */
 export class RpcClient extends EventEmitter {
@@ -73,7 +93,7 @@ export class RpcClient extends EventEmitter {
     try { Promise.resolve(this.onDiagnostic(event, details)).catch(() => {}); } catch {}
   }
   async connect() {
-    if (this.closed) throw new Error('RPC connection is closed.');
+    if (this.closed) throw closedError();
     if (this.socket && !this.socket.destroyed && !this.socket.connecting) return this.socket;
     if (this.connecting) return this.connecting;
     const connecting = new Promise((resolve, reject) => {
@@ -92,7 +112,7 @@ export class RpcClient extends EventEmitter {
       socket.setNoDelay(true); socket.setKeepAlive(true, 10000);
       socket.on('connect', () => {
         clearTimeout(connectTimer);
-        if (this.closed || this.socket !== socket) { socket.destroy(); reject(new Error('RPC connection is closed.')); return; }
+        if (this.closed || this.socket !== socket) { socket.destroy(); reject(this.closed ? closedError() : new Error('RPC connection is closed.')); return; }
         connected = true;
         this.diagnostic('rpc.connected', { stage: 'connect', durationMs: performance.now() - startedAt });
         this.emit('connected'); resolve(socket);
@@ -128,7 +148,7 @@ export class RpcClient extends EventEmitter {
       });
       socket.on('close', () => {
         clearTimeout(connectTimer);
-        if (!connected) reject(new Error('RPC connection closed before connecting.'));
+        if (!connected) reject(this.closed && !socketFailure ? closedError() : new Error('RPC connection closed before connecting.'));
         // An old socket may close after a new connection has already begun.
         // Reject only requests owned by this socket; never kill the new one.
         const error = new Error('Connection to the RPC server was lost.');
@@ -142,6 +162,15 @@ export class RpcClient extends EventEmitter {
     finally { if (this.connecting === connecting) this.connecting = null; }
   }
   failAll(error, socket = null, diagnosticError = error) {
+    const affected = request => !socket || request.socket === socket;
+    const draining = [...this.streams.values()].find(stream => stream.abandoned && affected(stream));
+    if (draining && !isLocalCancellation(error) &&
+        ![...this.pending.values(), ...this.streams.values()].some(request => !request.abandoned && affected(request))) {
+      // Its consumer already settled as cancellation, but malformed data or a
+      // timeout during the bounded drain is still a real transport failure.
+      this.diagnostic('rpc.failed', { method: draining.method, stage: 'stream',
+        durationMs: performance.now() - draining.startedAt, error: diagnosticError, unknownOutcome: false });
+    }
     for (const [id, request] of this.pending) if (!socket || request.socket === socket) {
       if (request.diagnostic) request.diagnostic.error ??= diagnosticError;
       clearRequest(request); this.pending.delete(id); request.reject(lossError(request, error));
@@ -219,11 +248,21 @@ export class RpcClient extends EventEmitter {
         stream.bytes += frameBytes;
         if (stream.records > 100000 || stream.bytes > 64 * 1024 * 1024) throw new Error('Bounty block exceeds the wallet resource limit; it was not applied.');
         stream.next++;
-        const callbackResult = stream.onChunk(params.items);
-        if (callbackResult && typeof callbackResult.then === 'function') {
-          // Unawaited callbacks could apply chunks after stream failure/lock.
-          Promise.resolve(callbackResult).catch(() => {});
-          throw new Error('RPC stream callbacks must be synchronous.');
+        if (!stream.abandoned) {
+          try {
+            const callbackResult = stream.onChunk(params.items);
+            if (callbackResult && typeof callbackResult.then === 'function') {
+              // Unawaited callbacks could apply chunks after stream failure/lock.
+              Promise.resolve(callbackResult).catch(() => {});
+              throw new Error('RPC stream callbacks must be synchronous.');
+            }
+          } catch (error) {
+            if (!isLocalCancellation(error)) throw error;
+            // STOP/lock discards the consumer's partial snapshot, not the shared
+            // connection. Keep validating/draining the stream under the same
+            // sequence, size, capacity, idle and total-deadline bounds.
+            stream.abandoned = true; stream.onChunk = null; stream.reject(error);
+          }
         }
         this.resetStreamTimer(params.stream_id, stream);
       }
@@ -236,14 +275,16 @@ export class RpcClient extends EventEmitter {
     clearTimeout(stream.timer);
     stream.timer = setTimeout(() => { this.failAll(new Error('Bounty transfer timed out.'), stream.socket); stream.socket.destroy(); }, this.timeoutMs);
   }
-  async pace(method, params) {
+  async pace(method, params, { signal } = {}) {
+    const waitingSignal = signal ? AbortSignal.any([this.abort.signal, signal]) : this.abort.signal;
     const key = method === 'getblockbounties' ? `${method}:${params.block_hash}` : method;
     const limit = method === 'getblockbounties' ? 8 : this.quota;
     for (;;) {
-      if (this.closed) throw new Error('RPC client is closed.');
+      if (this.closed) throw closedError();
+      if (waitingSignal.aborted) throw cancelledError();
       const now = performance.now();
       const cooldown = Math.max(this.cooldowns.get(method) ?? 0, this.cooldowns.get('*') ?? 0);
-      if (cooldown > now) { await delay(Math.ceil(cooldown - now), undefined, { signal: this.abort.signal }); continue; }
+      if (cooldown > now) { await delay(Math.ceil(cooldown - now), undefined, { signal: waitingSignal }); continue; }
       for (const [k, times] of this.history) if (!times.length || times.at(-1) <= now - this.windowMs) this.history.delete(k);
       const entries = this.history.get(key) ?? [];
       while (entries.length && entries[0] <= now - this.windowMs) entries.shift();
@@ -251,35 +292,43 @@ export class RpcClient extends EventEmitter {
         if (!this.history.has(key) && this.history.size >= 4096) throw new Error('RPC quota tracking capacity reached; retry after one minute.');
         entries.push(now); this.history.set(key, entries); return;
       }
-      await delay(Math.max(1, entries[0] + this.windowMs - now + 10), undefined, { signal: this.abort.signal });
+      await delay(Math.max(1, entries[0] + this.windowMs - now + 10), undefined, { signal: waitingSignal });
     }
   }
-  async request(method, params = {}, { onChunk } = {}) {
+  async request(method, params = {}, { onChunk, signal } = {}) {
     const startedAt = performance.now(), diagnostic = { stage: 'request', error: null };
     // Never copy caller params, arbitrary method names, or response bodies into diagnostics.
     const metadata = typeof method === 'string' && Object.hasOwn(PARAMS, method) ? { method } : {};
-    let queued = false, unknownOutcome = false;
+    let queued = false, sent = false, unknownOutcome = false, cancelled = false;
     try {
       const clean = validateRpcParams(method, params);
       if ((method === 'getblockbounties') !== (typeof onChunk === 'function')) throw new Error('Bounty requests require a stream callback; other requests must not use one.');
+      const waitingSignal = signal ? AbortSignal.any([this.abort.signal, signal]) : this.abort.signal;
+      if (waitingSignal.aborted) throw cancelledError();
       if (this.queuedRequests >= 32) throw new Error('Too many queued RPC requests; retry shortly.');
       this.queuedRequests++; queued = true;
-      await this.pace(method, clean);
+      await this.pace(method, clean, { signal: waitingSignal });
+      if (waitingSignal.aborted) throw cancelledError();
       diagnostic.stage = 'connect';
-      const socket = await this.connect();
+      const socket = await waitForConnection(this.connect(), waitingSignal);
       diagnostic.stage = 'request';
-      if (this.closed || socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
+      if (this.closed) throw closedError();
+      if (socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
       if (this.pending.size + this.streams.size >= 12) throw new Error('Too many RPC requests; retry shortly.');
       if (this.nextId >= Number.MAX_SAFE_INTEGER) throw new Error('RPC request identifier space exhausted. Reopen the wallet.');
       const id = ++this.nextId;
       const encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params: clean }) + '\n';
       if (Buffer.byteLength(encoded) > 900000 || socket.writableLength + Buffer.byteLength(encoded) > 2 * 1024 * 1024) throw new Error('RPC request exceeds the wallet output buffer limit.');
       return await new Promise((resolve, reject) => {
-        const request = { resolve, reject, method, socket, streaming: typeof onChunk === 'function', onChunk, sent: false, diagnostic };
+        if (waitingSignal.aborted) { reject(cancelledError()); return; }
+        const request = { resolve, reject, method, socket, streaming: typeof onChunk === 'function', onChunk, sent: false, diagnostic, startedAt };
         request.timer = setTimeout(() => { this.failAll(new Error('RPC request timed out.'), socket); socket.destroy(); }, this.timeoutMs);
         this.pending.set(id, request);
         try {
-          request.sent = true;
+          // There is no await between the final cancellation check and write.
+          // After write starts, preserve the real reply or unknown outcome;
+          // an individual abort must never cause a retry or lose that result.
+          request.sent = sent = true;
           socket.write(encoded, error => {
             if (error) { this.failAll(error, socket); socket.destroy(); }
           });
@@ -287,16 +336,25 @@ export class RpcClient extends EventEmitter {
       });
     } catch (error) {
       unknownOutcome = Boolean(error?.unknownOutcome);
-      this.diagnostic('rpc.failed', { ...metadata, stage: diagnostic.stage, durationMs: performance.now() - startedAt, error: diagnostic.error ?? this.connectionErrors.get(error) ?? error, unknownOutcome });
+      cancelled = error?.name === 'AbortError' && !unknownOutcome;
+      if (cancelled && !sent) error.notSent = true;
+      const details = { ...metadata, stage: diagnostic.stage, durationMs: performance.now() - startedAt, unknownOutcome };
+      if (cancelled) this.diagnostic('rpc.cancelled', details);
+      else {
+        const cause = diagnostic.error ?? this.connectionErrors.get(error) ?? error;
+        // A submitted broadcast still has an unknown outcome when local close
+        // interrupts its reply; do not label that case as harmless cancellation.
+        this.diagnostic('rpc.failed', { ...details, error: unknownOutcome && cause?.name === 'AbortError' ? error : cause });
+      }
       throw error;
     } finally {
       if (queued) this.queuedRequests--;
       const durationMs = performance.now() - startedAt;
-      if (durationMs >= 1000) this.diagnostic('rpc.slow', { ...metadata, stage: diagnostic.stage, durationMs, unknownOutcome });
+      if (!cancelled && durationMs >= 1000) this.diagnostic('rpc.slow', { ...metadata, stage: diagnostic.stage, durationMs, unknownOutcome });
     }
   }
   close() {
     this.closed = true; this.abort.abort();
-    this.failAll(new Error('RPC client closed.')); this.socket?.destroy(); this.socket = null;
+    this.failAll(closedError()); this.socket?.destroy(); this.socket = null;
   }
 }

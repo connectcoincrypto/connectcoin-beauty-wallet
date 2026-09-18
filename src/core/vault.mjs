@@ -1,8 +1,8 @@
 // Password encryption is separate from the optional BIP39 seed passphrase.
 import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt } from 'node:crypto';
-import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync } from 'node:fs';
+import { closeSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, renameSync } from 'node:fs';
 import { promisify } from 'node:util';
-import { chmod, link, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { networkParameters, normalizeMnemonic, validateMnemonic } from './crypto.mjs';
 
@@ -92,25 +92,35 @@ async function persist(file, envelope, replace, check = () => {}) {
     if (!replace) throw new Error('A wallet already exists at this location');
   } else if (replace) throw new Error('Wallet to update does not exist');
   const temporary = path.join(directory, `.wallet-${randomBytes(16).toString('hex')}.tmp`);
-  let handle;
+  let handle, published = false;
   try {
-    handle = await open(temporary, 'wx', 0o600);
-    await handle.writeFile(`${JSON.stringify(envelope)}\n`, 'utf8');
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    check();
-    // link() is atomic and refuses to replace an existing destination on create.
-    if (replace) await rename(temporary, destination);
-    else { await link(temporary, destination); await unlink(temporary); }
-    await chmod(destination, 0o600);
-    if (process.platform !== 'win32') {
-      const directoryHandle = await open(directory, 'r');
-      try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+    try {
+      handle = await open(temporary, 'wx', 0o600);
+      await handle.writeFile(`${JSON.stringify(envelope)}\n`, 'utf8');
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      check();
+      // Initial publication and authorization share one JS turn. linkSync is
+      // exclusive: it cannot overwrite a wallet that appeared during encryption.
+      if (replace) await rename(temporary, destination);
+      else linkSync(temporary, destination);
+      published = true;
+      if (!replace) await unlink(temporary);
+      await chmod(destination, 0o600);
+      if (process.platform !== 'win32') {
+        const directoryHandle = await open(directory, 'r');
+        try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+      }
+    } finally {
+      await handle?.close().catch(() => {});
+      await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
     }
-  } finally {
-    await handle?.close().catch(() => {});
-    await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  } catch (error) {
+    if (!published) throw error;
+    // Include cleanup failures: the installed wallet must remain accessible even
+    // if a later permission update, temporary-file removal or flush fails.
+    throw Object.assign(new Error('The encrypted wallet was installed, but storage could not confirm a complete save. Keep your recovery phrase safe and verify access with the password used for this save.', { cause: error }), { walletPublished: true });
   }
 }
 export async function createVault(file, payload, password, { check = () => {} } = {}) {

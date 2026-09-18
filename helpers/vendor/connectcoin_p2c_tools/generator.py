@@ -4,11 +4,13 @@ import ipaddress
 import math
 import socket
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 
 from .envelope import ConnectionProof
 from .errors import P2CError, ProofFormatError, ProofVerificationError
@@ -36,12 +38,42 @@ class GenerationOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class AttemptStats:
+    """Last 100 capture outcomes, oldest first, with a per-run sequence count."""
+
+    completed: int = 0
+    recent: tuple[tuple[bool, float], ...] = ()
+
+
+class _AttemptRecorder:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._completed = 0
+        self._recent: deque[tuple[bool, float]] = deque(maxlen=100)
+
+    def record(self, success: bool, seconds: float) -> None:
+        # Match Core's treatment of invalid clock observations. A successful
+        # capture is counted before certificate verification or the work test.
+        if type(success) is not bool or not math.isfinite(seconds) or seconds < 0:
+            return
+        with self._lock:
+            self._completed += 1
+            self._recent.append((success, round(seconds, 6)))
+
+    def snapshot(self) -> AttemptStats:
+        with self._lock:
+            return AttemptStats(self._completed, tuple(self._recent))
+
+
+@dataclass(frozen=True, slots=True)
 class GenerationProgress:
     attempts: int
     elapsed: float
     attempts_per_second: float
     best_work_hash: str | None
     last_error: str | None
+    attempt_stats: AttemptStats = AttemptStats()
+    finished: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +179,64 @@ def generate_connection_proof(
     progress: ProgressCallback | None = None,
 ) -> GenerationResult:
     """Search real TLS connections until one satisfies the P2C work target."""
+    recorder = _AttemptRecorder()
+    started_at = time.monotonic()
+    last_update: GenerationProgress | None = None
+
+    def observe(update: GenerationProgress) -> None:
+        nonlocal last_update
+        last_update = update
+        if progress is not None:
+            progress(update)
+
+    try:
+        result = _generate_connection_proof(context, roots_path, options, observe, recorder)
+    finally:
+        # The inner function has already joined running captures. Include their
+        # real outcomes even when an earlier capture won or the budget expired.
+        # DNS/root failures and queued futures cancelled before starting do not
+        # create synthetic failed TLS attempts.
+        stats = recorder.snapshot()
+        elapsed = time.monotonic() - started_at
+        if progress is not None:
+            progress(GenerationProgress(
+                attempts=stats.completed,
+                elapsed=elapsed,
+                attempts_per_second=stats.completed / elapsed if elapsed else 0.0,
+                best_work_hash=last_update.best_work_hash if last_update else None,
+                last_error=last_update.last_error if last_update else None,
+                attempt_stats=stats,
+                finished=True,
+            ))
+    return replace(result, attempts=stats.completed, elapsed=elapsed)
+
+
+def _capture_observed(
+    endpoint: Endpoint,
+    context: ConnectionProof,
+    timeout: float,
+    recorder: _AttemptRecorder,
+) -> TLSProofMessages:
+    # Begin inside the worker: executor queue time is not connection latency.
+    started_at = time.monotonic()
+    success = False
+    try:
+        captured = _capture(endpoint, context, timeout)
+        success = True
+        return captured
+    finally:
+        # Recording here, under one lock, preserves completion order instead of
+        # the arbitrary iteration order of concurrent.futures.wait's done set.
+        recorder.record(success, time.monotonic() - started_at)
+
+
+def _generate_connection_proof(
+    context: ConnectionProof,
+    roots_path: str | Path,
+    options: GenerationOptions | None,
+    progress: ProgressCallback,
+    recorder: _AttemptRecorder,
+) -> GenerationResult:
     if options is None:
         options = GenerationOptions()
     _validate_options(options)
@@ -208,7 +298,7 @@ def generate_connection_proof(
                         attempt_timeout,
                         options.overall_timeout - (now - started_at),
                     )
-                future = executor.submit(_capture, endpoint, context, attempt_timeout)
+                future = executor.submit(_capture_observed, endpoint, context, attempt_timeout, recorder)
                 pending[future] = attempts_started
                 if options.connections_per_second != -1:
                     interval = 1.0 / options.connections_per_second
@@ -270,13 +360,15 @@ def generate_connection_proof(
 
             if progress is not None and attempts_completed:
                 elapsed = time.monotonic() - started_at
+                stats = recorder.snapshot()
                 progress(
                     GenerationProgress(
-                        attempts=attempts_completed,
+                        attempts=stats.completed,
                         elapsed=elapsed,
-                        attempts_per_second=attempts_completed / elapsed if elapsed else 0.0,
+                        attempts_per_second=stats.completed / elapsed if elapsed else 0.0,
                         best_work_hash=best_hash,
                         last_error=last_error,
+                        attempt_stats=stats,
                     )
                 )
     finally:

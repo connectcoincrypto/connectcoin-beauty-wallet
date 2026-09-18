@@ -23,7 +23,7 @@ class Backend extends EventEmitter {
 }
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(),'beauty-service-test-'));
-  const service = new WalletService({directory,clientFactory:()=>new Backend()});
+  const service = new WalletService({directory,clientFactory:()=>new Backend(),proofRunner:async()=> '020100'});
   await service.initialize();
   t.after(async()=>{await service.close();assert.ok(resolve(directory).startsWith(resolve(tmpdir())+ '\\beauty-service-test-') || resolve(directory).startsWith(resolve(tmpdir())+'/beauty-service-test-'));await rm(directory,{recursive:true,force:true});});
   return service;
@@ -41,14 +41,14 @@ test('transient claim failure remains on disk and in history after a successful 
   const s = await fixture(t);
   await s.setDeveloperMode({ enabled: true });
   const setup = await create(s);
+  s.engine.setOptions({ connectionsPerSecond: 256, concurrency: 1 });
   s.engine.prepare = async item => {
     if (item.vout === 0) throw Object.assign(new Error('untrusted diagnostic canary ' + PASSWORD), { code: -32020, data: { node_code: -26 } });
     return { context: { domain: 'example.com', txid: '01'.repeat(32), input_index: 0,
       connection_work_target: 'ff'.repeat(32), root_certificates_version: 1, signature_algorithms_mask: 7, validation_time: 1800000000 } };
   };
-  s.engine.generateProof = async () => '020100';
   s.engine.submit = async prepared => prepared.context.txid;
-  s.engine.enqueue([0, 1].map(vout => ({ txid: '02'.repeat(32), vout, status: 'available' })));
+  s.engine.enqueue([0, 1].map(vout => ({ txid: '02'.repeat(32), vout, amount: vout === 0 ? '2000000000' : '1000000000', domain: 'example.com', connection_work_target: 'f'.repeat(64), signature_algorithms_mask: 7, root_certificates_version: 1, status: 'available' })));
   s.engine.start();
   for (let i = 0; i < 100 && s.engine.snapshot().completed !== 1; i++) await new Promise(resolve => setTimeout(resolve, 5));
   assert.equal(s.engine.snapshot().completed, 1);
@@ -138,6 +138,14 @@ test('late network and QR completions cannot repopulate locked state',async t=>{
   assert.equal(s.qrDataUrl,null);assert.equal(s.session,null);
 });
 
+test('wallet locking gives the claims engine a distinct cancellation reason', async t => {
+  const s = await fixture(t); await create(s);
+  const reasons = [], stop = s.engine.stop.bind(s.engine);
+  s.engine.stop = reason => { reasons.push(reason); return stop(reason); };
+  await s.lock();
+  assert.equal(reasons[0], 'locked');
+});
+
 test('lock emits cleared secrets before slow helper shutdown and close drains encrypted writes',async t=>{
   const s=await fixture(t);await create(s);
   let finishStop, finishWrite;
@@ -151,6 +159,41 @@ test('lock emits cleared secrets before slow helper shutdown and close drains en
   await new Promise(resolve=>setImmediate(resolve));assert.equal(closed,false);
   finishWrite();await closing;assert.equal(closed,true);
   s.engine.stop=originalStop;
+});
+
+test('closing drains an interrupted refresh as cancellation before the lifecycle marker', async t => {
+  const s = await fixture(t); await create(s);
+  const errors = s.diagnostics.snapshot().errors;
+  let rejectRefresh;
+  s.refreshInternal = () => new Promise((_, reject) => { rejectRefresh = reject; });
+  const rpc = s.rpc, close = rpc.close.bind(rpc);
+  rpc.close = () => { close(); rejectRefresh(Object.assign(new Error('RPC client closed.'), { name: 'AbortError', code: 'ABORT_ERR' })); };
+  const pending = assert.rejects(s.refresh(), error => error.name === 'AbortError');
+  await s.close(); await pending;
+  const rows = (await readFile(s.diagnostics.snapshot().file, 'utf8')).trim().split('\n').map(JSON.parse);
+  const cancelled = rows.findIndex(row => row.event === 'wallet.refresh_cancelled');
+  const closed = rows.findIndex(row => row.event === 'wallet.closed');
+  assert.ok(cancelled >= 0 && cancelled < closed);
+  assert.equal(rows[cancelled].details.error, undefined);
+  assert.equal(rows.some(row => row.event === 'wallet.refresh_failed'), false);
+  assert.equal(s.diagnostics.snapshot().errors, errors);
+  assert.equal(s.error, null);
+});
+
+test('closing does not hide a real refresh failure already in flight', async t => {
+  const s = await fixture(t); await create(s);
+  const errors = s.diagnostics.snapshot().errors;
+  let rejectRefresh;
+  s.refreshInternal = () => new Promise((_, reject) => { rejectRefresh = reject; });
+  const failure = Object.assign(new Error('Connection to the RPC server was lost.'), { code: 'ECONNRESET' });
+  const pending = assert.rejects(s.refresh(), error => error === failure);
+  rejectRefresh(failure);
+  await s.close(); await pending;
+  const rows = (await readFile(s.diagnostics.snapshot().file, 'utf8')).trim().split('\n').map(JSON.parse);
+  const failed = rows.findIndex(row => row.event === 'wallet.refresh_failed');
+  assert.ok(failed >= 0 && failed < rows.findIndex(row => row.event === 'wallet.closed'));
+  assert.equal(rows[failed].details.error.category, 'network');
+  assert.equal(s.diagnostics.snapshot().errors, errors + 1);
 });
 
 test('appearance persists without touching the wallet, connection, claims or payment review',async t=>{

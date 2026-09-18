@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream';
 import { ClaimsEngine, createProofRunner, validateClaimContext, validateClaimOptions } from '../src/core/claims.mjs';
 
 const context = () => ({ domain: 'example.com', txid: '01'.repeat(32), input_index: 0, connection_work_target: 'ff'.repeat(32), root_certificates_version: 1, signature_algorithms_mask: 7, validation_time: 1800000000 });
-const bounty = (vout = 0) => ({ txid: '02'.repeat(32), vout, domain: 'example.com', status: 'available' });
+const bounty = (vout = 0) => ({ txid: '02'.repeat(32), vout, amount: '1000000000', domain: 'example.com', status: 'available', connection_work_target: 'f'.repeat(64), signature_algorithms_mask: 7, root_certificates_version: 1 });
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 async function until(predicate) { for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise((resolve) => setTimeout(resolve, 2)); } throw new Error('Timed out waiting for claims state'); }
 
@@ -86,10 +86,12 @@ function fakeSpawn(send) {
     return child;
   } };
 }
-const validResult = (request) => ({ type: 'result', context: request.context, proof: '020100', verified: true });
+const validResult = (request) => ({ type: 'result', context: request.context, proof: '020100', verified: true, attempts: 1 });
+const validProgress = { type: 'progress', attempts: 1, elapsed: 0.1, attemptStats: { completed: 1, recent: [[true, 0.1]] } };
 
 test('proof runner sends only public context via stdin, no shell; requires verified matching result and clean exit', async () => {
   const fixture = fakeSpawn((child, request) => {
+    child.stdout.write(`${JSON.stringify(validProgress)}\n`);
     child.stdout.write(`${JSON.stringify(validResult(request))}\n`);
     child.emit('close', 0);
   });
@@ -113,10 +115,10 @@ test('proof runner rejects tampered contexts, oversized frames, unknown messages
     (request) => JSON.stringify(validResult(request)),
   ];
   for (const makeResponse of cases) {
-    const fixture = fakeSpawn((child, request) => { child.stdout.write(makeResponse(request)); setImmediate(() => child.emit('close', 0)); });
+    const fixture = fakeSpawn((child, request) => { child.stdout.write(`${JSON.stringify(validProgress)}\n${makeResponse(request)}`); setImmediate(() => child.emit('close', 0)); });
     await assert.rejects(createProofRunner({ ...fixture, helper: { command: 'test' } })(context()));
   }
-  const fixture = fakeSpawn((child, request) => { child.stdout.write(`${JSON.stringify(validResult(request))}\n`); child.emit('close', 1); });
+  const fixture = fakeSpawn((child, request) => { child.stdout.write(`${JSON.stringify(validProgress)}\n${JSON.stringify(validResult(request))}\n`); child.emit('close', 1); });
   await assert.rejects(createProofRunner({ ...fixture, helper: { command: 'test' } })(context()));
 });
 
@@ -181,7 +183,7 @@ test('stop aborts active work and forbids another worker until cleanup', async (
 
 test('bounded queue, backoff and unavailable bounties avoid flooding and stale broadcasts', async () => {
   let attempts = 0;
-  const engine = new ClaimsEngine({ isUnlocked: () => true, maxQueue: 2, retryDelayMs: 300000, prepare: async () => { attempts++; throw new Error('bounty unavailable'); }, generateProof: async () => { throw new Error('must not generate'); }, submit: async () => { throw new Error('must not submit'); } });
+  const engine = new ClaimsEngine({ isUnlocked: () => true, maxQueue: 2, retryDelayMs: 300000, randomIndex: () => 0, prepare: async () => { attempts++; throw new Error('bounty unavailable'); }, generateProof: async () => { throw new Error('must not generate'); }, submit: async () => { throw new Error('must not submit'); } });
   assert.equal(engine.enqueue([bounty(), bounty(1), bounty(2)]), 2);
   engine.start();
   await until(() => attempts === 2 && !engine.running);
@@ -239,7 +241,7 @@ test('only explicit recognized submit rejections are classified as diagnostic no
     assert.equal(engine.snapshot().lastErrorDiagnostic, false);
     engine.enqueue([bounty()]); engine.start();
     try {
-      await until(() => !!engine.snapshot().lastError && !engine.running);
+      await until(() => !!engine.snapshot().lastError);
       assert.equal(engine.snapshot().lastErrorDiagnostic, stage === 'submit' && recoverable,
         `${stage}, node ${String(fields.data?.node_code)}, unknown ${String(fields.unknownOutcome)}`);
       assert.equal(engine.snapshot().lastError, failure.message);
