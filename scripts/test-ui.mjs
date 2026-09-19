@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { GENESIS } from '../src/core/config.mjs';
 import { createRequire } from 'node:module';
 import { waitForUiCondition } from './ui-wait.mjs';
+import { closeElectronTest } from './ui-close.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-test-'));
@@ -157,7 +158,7 @@ try {
   assert.equal(await page.evaluate(() => getComputedStyle(document.body).backgroundColor), darkCanvas);
   // A fresh Electron main process must apply the saved choice before showing
   // the first window. The isolated profile contains no wallet yet.
-  await application.close(); application = null;
+  await closeElectronTest(application); application = null;
   await openApplication(executablePath);
   assert.equal(await application.evaluate(({ nativeTheme }) => nativeTheme.themeSource), 'dark');
   await waitForScheme(true);
@@ -372,7 +373,6 @@ try {
   assert.deepEqual(errors, []);
   assert.deepEqual(failedBrandRequests, [], 'ConnectWallet artwork must remain allowed by the renderer resource policy.');
   passed = true;
-  console.log(`PASS: real Electron isolation, ConnectWallet title and decoded artwork, appearance, Developer Mode visibility and critical alerts, persistence, draft preservation, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure. Screenshots: ${screenshots}`);
 } catch (error) {
   // Avoid Playwright action dumps: they could contain a generated backup word.
   const sourceLine = /test-ui\.mjs:(\d+):\d+/.exec(String(error.stack ?? ''))?.[1];
@@ -381,7 +381,8 @@ try {
   process.exitCode = 1;
 } finally {
   seed.fill(''); seed = [];
-  await application?.close().catch(() => {});
+  try { console.log(`UI shutdown: ${JSON.stringify(await closeElectronTest(application))}`); }
+  catch { passed = false; process.exitCode = 1; console.error('UI graceful shutdown failed.'); }
   for (const socket of sockets) socket.destroy();
   await new Promise(resolve => fixture.close(resolve));
   if (passed) {
@@ -391,3 +392,4 @@ try {
     await rm(absolute, { recursive: true, force: true });
   }
 }
+if (passed) console.log(`PASS: real Electron isolation, ConnectWallet title and decoded artwork, appearance, Developer Mode visibility and critical alerts, persistence, draft preservation, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure and graceful shutdown. Screenshots: ${screenshots}`);

@@ -102,6 +102,43 @@ test('budget rejection before TCP does not invent a capture or start notificatio
   assert.equal(result.blocked, 'budget'); assert.equal(events, 0);
 });
 
+for (const [message, expected, category] of [
+  ['TLS connection timed out', 'TLS connection timed out', 'timeout'],
+  ['TLS capture or proof validation failed', 'TLS capture or proof validation failed', 'proof-failed'],
+  ['TLS capture cancelled', 'TLS capture cancelled', 'unknown'],
+  ['Public DNS resolution is required', 'Public DNS resolution is required', 'unknown'],
+  ['private-peer-details: timed out', 'TLS capture or proof validation failed', 'proof-failed'],
+  [{ private: 'private-peer-details' }, 'TLS capture or proof validation failed', 'proof-failed'],
+]) test(`attempt descriptions retain only allowlisted text: ${typeof message === 'string' ? message : 'non-string'}`, async t => {
+  const { pool, children } = fixture(t, (command, child) => {
+    const value = observation(command, { captured: false, successfulConnections: command.successfulConnections });
+    child.send({ type: 'started', id: command.id });
+    child.send({ type: 'capture', ...value });
+    child.send({ type: 'attempt', ...value, proof: null, verified: false, message });
+  });
+  await pool.start({});
+  const result = await pool.attempt(context(), { bountyId, successfulConnections: 2n });
+  assert.equal(result.message, expected);
+  assert.equal(diagnosticError(new Error(result.message)).category, category);
+  assert.equal(result.successfulConnections, '2');
+  assert.equal(result.cancelled, false);
+  assert.ok(!JSON.stringify(result).includes('private-peer-details'));
+  assert.equal(pool.failure, undefined);
+  assert.equal(children[0].killed, false);
+  assert.equal(pool.requests.size, 0);
+});
+
+test('fatal helper error frames never expose arbitrary message text', async t => {
+  const { pool, children } = fixture(t, (_command, child) => child.send({ type: 'error', message: 'private-peer-details: timed out' }));
+  await pool.start({});
+  await assert.rejects(pool.attempt(context(), { bountyId }), error => {
+    assert.equal(error.message, 'Claims helper failed');
+    assert.equal(diagnosticError(error).category, 'helper-failed');
+    return error.helperFatal === true;
+  });
+  assert.equal(children[0].killed, true);
+});
+
 test('cancellation sends only its request ID and waits for the terminal acknowledgement', async t => {
   const pending = new Map();
   const { pool, commands, children } = fixture(t, command => { if (command.type === 'attempt') pending.set(command.id, command); });

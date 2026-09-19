@@ -14,6 +14,7 @@ import { DiagnosticLog } from './diagnostics.mjs';
 import { StatePublisher } from './state-publisher.mjs';
 import { performance } from 'node:perf_hooks';
 import { selectVaultFile, VAULT_NAME } from './profile-paths.mjs';
+import { createRsaProbe } from './rsa-probe.mjs';
 
 const HASH = /^[0-9a-f]{64}$/;
 const MONEY = /^-?\d{1,19}$/;
@@ -26,16 +27,28 @@ function walletName(name) {
   return name.trim();
 }
 function formatSigned(value) { return value < 0n ? `-${formatCoinAmount(-value)}` : formatCoinAmount(value); }
+function waitForReview(promise, signal) {
+  // Cancel this review's wait, never a refresh shared with the rest of the wallet.
+  return new Promise((resolve, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); reject(Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' })); };
+    Promise.resolve(promise).then(value => { signal.removeEventListener('abort', abort); resolve(value); },
+      error => { signal.removeEventListener('abort', abort); reject(error); });
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
 function validateRow(row) {
   if (!row || !HASH.test(row.txid)) throw new Error('Invalid transaction returned by RPC.');
   return row;
 }
 export class WalletService extends EventEmitter {
-  constructor({ directory, resourcesPath, allowRegtest = false, clientFactory = options => new RpcClient(options), proofRunner, connectionPoolFactory } = {}) {
+  constructor({ directory, resourcesPath, allowRegtest = false, clientFactory = options => new RpcClient(options), proofRunner, connectionPoolFactory, rsaProbe } = {}) {
     super(); Object.assign(this, { directory, resourcesPath, allowRegtest, clientFactory, proofRunner, connectionPoolFactory });
     this.vaultFile = join(directory, VAULT_NAME);
     this.diagnostics = null;
     this.session = null; this.epoch = 0; this.setup = null; this.preview = null;
+    this.rsaProbe = rsaProbe ?? createRsaProbe({ resourcesPath });
+    this.sendPreparation = null;
     this.replacement = null; this.walletWrite = null; this.closed = false;
     this.walletExists = false; this.accounts = []; this.accountCache = new Map(); this.utxos = []; this.history = [];
     this.balance = null; this.qrDataUrl = null; this.error = null; this.rpc = null;
@@ -63,6 +76,7 @@ export class WalletService extends EventEmitter {
     return this.getState();
   }
   connectClient() {
+    this.cancelSendPreview();
     this.rpc?.close(); this.refreshing = null; this.fundingPending.clear();
     const rpc = this.clientFactory({ ...this.config.rpc, onDiagnostic: (event, details) => this.recordDiagnostic(event, details) }); this.rpc = rpc;
     this.tip = null;
@@ -71,7 +85,7 @@ export class WalletService extends EventEmitter {
       if (this.rpc !== rpc) return;
       this.tip = null;
       this.network.status = 'offline';
-      this.preview = null;
+      this.cancelSendPreview();
       void this.engine?.stop(); this.emitState();
     });
   }
@@ -268,6 +282,7 @@ export class WalletService extends EventEmitter {
     this.persisting = operation; await operation;
   }
   async lock() {
+    this.cancelSendPreview();
     this.epoch++; this.preview = null; this.setup = null; this.replacement = null;
     const epoch = this.epoch;
     this.session = null; this.accounts = []; this.utxos = []; this.history = []; this.balance = null; this.qrDataUrl = null;
@@ -307,25 +322,37 @@ export class WalletService extends EventEmitter {
     this.tip = tip; return tip;
   }
   checkResponse(response) { validateTip(response?.tip, this.config.network); return response; }
-  async page(method, address, { firstOnly = false } = {}) {
-    const epoch = this.epoch; const items = []; let cursor; const seen = new Set();
+  async page(method, address, { firstOnly = false, onTip } = {}) {
+    const epoch = this.epoch, rpc = this.rpc; const items = []; let cursor; const seen = new Set();
     do {
       this.assertSession(epoch);
-      const result = this.checkResponse(await this.rpc.request(method, { address, ...(cursor ? { cursor } : {}) }));
+      if (seen.size >= 1000) throw new Error('Address pagination exceeds this release’s local resource limit.');
+      const result = this.checkResponse(await rpc.request(method, { address, ...(cursor ? { cursor } : {}) }));
       this.assertSession(epoch);
+      if (rpc !== this.rpc) throw new Error('RPC connection changed.');
       if (result.address !== address || result.unit !== 'connects' || !Array.isArray(result.items) || result.items.length > 500) throw new Error('RPC returned an invalid address page.');
+      onTip?.(result.tip);
       items.push(...result.items.map(validateRow));
       if (items.length > 20000) throw new Error('Address history exceeds this release’s local resource limit. No partial balance was accepted.');
       cursor = result.next_cursor;
-      if (cursor !== null && (typeof cursor !== 'string' || cursor.length > 4096 || seen.has(cursor))) throw new Error('RPC returned an invalid or repeated cursor.');
+      if (cursor !== null && (typeof cursor !== 'string' || !cursor.length || cursor.length > 4096 || seen.has(cursor))) throw new Error('RPC returned an invalid or repeated cursor.');
       seen.add(cursor);
-      if (firstOnly) break;
+      // An empty page may still have a continuation; only a positive result or
+      // exhaustion proves whether this address contributes to the recovery gap.
+      if (firstOnly && items.length) break;
     } while (cursor);
     return items;
   }
   async recoverAddresses(epoch) {
     this.recovering = true; this.emitState();
     try {
+      const emptyAddresses = new Set(), rpc = this.rpc, tipHash = this.tip?.hash;
+      let stableTip = true;
+      const onTip = tip => {
+        if (tip.hash !== tipHash || this.tip?.hash !== tipHash || this.rpc !== rpc) {
+          stableTip = false; emptyAddresses.clear();
+        }
+      };
       const lastUsed = [-1,-1];
       for (const change of [0,1]) {
         let gap = 0;
@@ -333,8 +360,9 @@ export class WalletService extends EventEmitter {
           this.assertSession(epoch);
           if (index >= 1000) throw new Error('Recovery reached the 1,000-address safety limit. Contact support before using this wallet.');
           const account = this.publicAccount(index, change);
-          const history = await this.page('getaddresshistory', account.address, { firstOnly: true });
+          const history = await this.page('getaddresshistory', account.address, { firstOnly: true, onTip });
           if (history.length) { lastUsed[change] = index; gap = 0; } else gap++;
+          if (!history.length && stableTip) emptyAddresses.add(account.address);
         }
       }
       this.assertSession(epoch);
@@ -343,6 +371,7 @@ export class WalletService extends EventEmitter {
       this.session.data.lastUsedReceive = lastUsed[0]; this.session.data.lastUsedChange = lastUsed[1]; this.session.data.needsRecovery = false;
       this.session.data.scanLookahead = true;
       await this.persist(); this.assertSession(epoch); this.buildAccounts(); await this.makeQR();
+      return emptyAddresses;
     } finally { this.recovering = false; this.emitState(); }
   }
   async refresh() {
@@ -363,23 +392,38 @@ export class WalletService extends EventEmitter {
   }
   async refreshInternal(epoch) {
     await this.ensureNetwork(); this.assertSession(epoch);
-    if (this.session.data.needsRecovery) await this.recoverAddresses(epoch);
+    const rpc = this.rpc, recoveryTipHash = this.tip.hash;
+    const emptyAddresses = this.session.data.needsRecovery ? await this.recoverAddresses(epoch) : null;
+    // Reuse only fully exhausted empty discovery results inside this refresh.
+    // A new block, same-height fork, or changed connection invalidates them.
+    let stableRecoveryTip = true, reusedEmptyHistory = false;
+    const onTip = tip => {
+      if (tip.hash !== recoveryTipHash || this.tip?.hash !== recoveryTipHash || this.rpc !== rpc) stableRecoveryTip = false;
+    };
+    if (emptyAddresses?.size) onTip(await this.ensureNetwork());
+    this.assertSession(epoch);
+    if (rpc !== this.rpc) throw new Error('RPC connection changed.');
     const totals = { confirmed: 0n, available: 0n, pending: 0n, immature: 0n };
     const utxos = [], history = new Map(); let highestReceive = this.session.data.lastUsedReceive ?? -1, highestChange = this.session.data.lastUsedChange ?? -1;
     for (const account of this.accounts) {
       this.assertSession(epoch);
+      if (rpc !== this.rpc) throw new Error('RPC connection changed.');
+      onTip(this.tip ?? {});
       // Restored wallets must keep watching their unused gap: a payment may arrive
       // later at an address issued by the old installation before restoration.
-      const transactions = await this.page('getaddresshistory', account.address);
+      const reuseEmpty = stableRecoveryTip && emptyAddresses?.has(account.address);
+      const transactions = reuseEmpty ? [] : await this.page('getaddresshistory', account.address, { onTip });
+      reusedEmptyHistory ||= Boolean(reuseEmpty);
       if (transactions.length && account.change === 0) highestReceive = Math.max(highestReceive, account.index);
       if (transactions.length && account.change === 1) highestChange = Math.max(highestChange, account.index);
       const issuedIndex = this.session.data[account.change ? 'changeIndex' : 'receiveIndex'];
       if (!transactions.length && account.index > issuedIndex) continue;
       const balance = this.checkResponse(await this.rpc.request('getaddressbalance', { address: account.address }));
+      onTip(balance.tip);
       if (balance.address !== account.address || balance.unit !== 'connects') throw new Error('Invalid RPC balance.');
       totals.confirmed += amount(balance.confirmed); totals.available += amount(balance.available_confirmed);
       totals.pending += amount(balance.pending_delta); totals.immature += amount(balance.immature);
-      const rows = await this.page('getaddressutxos', account.address);
+      const rows = await this.page('getaddressutxos', account.address, { onTip });
       for (const row of rows) {
         if (!Number.isInteger(row.vout) || row.vout < 0 || row.vout > 0xffffffff || amount(row.amount) < 0n) throw new Error('Invalid RPC output.');
         utxos.push({ ...row, account });
@@ -391,6 +435,14 @@ export class WalletService extends EventEmitter {
       }
     }
     this.assertSession(epoch);
+    if (rpc !== this.rpc) throw new Error('RPC connection changed.');
+    if (reusedEmptyHistory) {
+      onTip(await this.ensureNetwork());
+      this.assertSession(epoch);
+      // Some addresses may already have been skipped before a later response
+      // revealed a changed tip. Re-read all addresses, with no recovery cache.
+      if (!stableRecoveryTip) return this.refreshInternal(epoch);
+    }
     this.utxos = utxos;
     this.balance = Object.fromEntries(Object.entries(totals).map(([key,value]) => [key, formatSigned(value)]));
     this.history = [...history.values()].sort((a,b) => (b.block_height ?? Number.MAX_SAFE_INTEGER) - (a.block_height ?? Number.MAX_SAFE_INTEGER)).map(row => ({
@@ -442,29 +494,67 @@ export class WalletService extends EventEmitter {
     this.fundingPending.set(txid, entry);
     return wait(entry.promise);
   }
+  cancelSendPreview() {
+    this.sendPreparation?.abort();
+    this.sendPreparation = null;
+    this.preview = null;
+  }
   async previewSend({ address, amount: coins, feeRate = this.config.feeRate, domain, expectedConnections } = {}) {
     this.assertSession(); const epoch = this.epoch;
     if (this.session.data.needsRecovery) throw new Error('Wait for recovery discovery to finish before sending.');
+    this.cancelSendPreview();
     const value = parseCoinAmount(coins); if (value <= 0n) throw new Error('Enter an amount greater than zero.');
-    await this.refresh(); this.assertSession(epoch);
-    const eligible = this.utxos.filter(u => u.status === 'confirmed' && u.mature === true && !this.reserved.has(`${u.txid}:${u.vout}`)).sort((a,b) => BigInt(a.amount) > BigInt(b.amount) ? -1 : 1);
+    const preparation = new AbortController(), rpc = this.rpc;
+    this.sendPreparation = preparation;
+    const check = () => {
+      this.assertSession(epoch);
+      if (preparation.signal.aborted || this.sendPreparation !== preparation || this.rpc !== rpc) {
+        throw Object.assign(new Error('Payment review cancelled. Review the payment again.'), { name: 'AbortError' });
+      }
+    };
     const verified = []; const keys = [];
     try {
+      await waitForReview(this.refresh(), preparation.signal); check();
+      const eligible = this.utxos.filter(u => u.status === 'confirmed' && u.mature === true && !this.reserved.has(`${u.txid}:${u.vout}`)).sort((a,b) => BigInt(a.amount) > BigInt(b.amount) ? -1 : 1);
       let total = 0n;
       for (const utxo of eligible.slice(0,256)) {
-        const rawTransaction = await this.funding(utxo.txid); this.assertSession(epoch);
+        const rawTransaction = await this.funding(utxo.txid, { signal: preparation.signal }); check();
         const key = deriveAccount(this.session.data.mnemonic, { network: this.config.network, index: utxo.account.index, change: utxo.account.change, passphrase: this.session.data.passphrase });
         keys.push(key.privateKey); verified.push({ ...utxo, rawTransaction, privateKey: key.privateKey });
         total += BigInt(utxo.amount);
         if (total > value + 100000000n) break;
       }
-      this.assertSession(epoch);
+      check();
       const change = this.publicAccount(this.session.data.changeIndex, 1);
       const output = domain === undefined ? { address, amount: value.toString() } : { domain, amount: value.toString(), expectedConnections, rootVersion: 1, mask: 7 };
-      const payment = buildPayment({ utxos: verified, outputs: [output], changeAddress: change.address, network: this.config.network, feeRate });
-      this.preview = { ...payment, previewId: randomUUID(), epoch, expires: Date.now() + 120000, address: domain ?? address, amount: formatCoinAmount(value), changeIndex: change.index };
-      return { previewId: this.preview.previewId, address: this.preview.address, amount: formatCoinAmount(value), fee: formatCoinAmount(BigInt(payment.fee)), total: formatCoinAmount(value + BigInt(payment.fee)), txid: payment.txid, type: domain ? 'p2c' : 'payment' };
-    } finally { for (const key of keys) key.fill(0); }
+      const build = () => buildPayment({ utxos: verified, outputs: [output], changeAddress: change.address, network: this.config.network, feeRate });
+      // Validate funding/fees/domain before opening a connection. No wallet keys
+      // or transaction bytes are ever passed to the isolated capability helper.
+      let payment = build(), policy = {};
+      if (domain !== undefined) {
+        output.domain = payment.transaction.outputs[0].domain;
+        let result;
+        try {
+          result = await waitForReview(this.rsaProbe({ domain: output.domain, rootVersion: 1, validationTime: Math.floor(Date.now() / 1000) }, { signal: preparation.signal }), preparation.signal);
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error;
+          result = { verified: false, status: 'failed' };
+        }
+        check();
+        const rsaVerified = result?.verified === true && result.status === 'verified';
+        output.mask = rsaVerified ? 6 : 7;
+        if (rsaVerified) payment = build();
+        const status = rsaVerified ? 'verified' : ['unavailable', 'timeout', 'busy'].includes(result?.status) ? result.status : 'failed';
+        policy = { signatureAlgorithmsMask: output.mask, rsaProbeStatus: status, expectedConnections: String(expectedConnections ?? '1') };
+      }
+      check();
+      // The selected mask and signed bytes are frozen together for confirmation.
+      this.preview = { ...payment, ...policy, previewId: randomUUID(), epoch, expires: Date.now() + 120000, address: domain === undefined ? address : output.domain, amount: formatCoinAmount(value), changeIndex: change.index };
+      return { previewId: this.preview.previewId, address: this.preview.address, amount: formatCoinAmount(value), fee: formatCoinAmount(BigInt(payment.fee)), total: formatCoinAmount(value + BigInt(payment.fee)), txid: payment.txid, type: domain === undefined ? 'payment' : 'p2c', ...policy };
+    } finally {
+      for (const key of keys) key.fill(0);
+      if (this.sendPreparation === preparation) this.sendPreparation = null;
+    }
   }
   async confirmSend({ previewId } = {}) {
     const preview = this.preview; this.preview = null;
@@ -487,6 +577,7 @@ export class WalletService extends EventEmitter {
   }
   async saveConfig(input = {}) {
     const config = validateConfig({ ...this.config, ...input, network: this.config.network, rpc: { ...this.config.rpc, ...input.rpc }, claims: { ...this.config.claims, ...input.claims } }, { allowRegtest: this.allowRegtest });
+    this.cancelSendPreview();
     this.epoch++; this.replacement = null; this.setup = null; this.rpc?.close(); this.refreshing = null;
     await this.engine.stop(); this.engine.clear(); this.preview = null;
     this.config = await writeConfig(this.directory, config, { allowRegtest: this.allowRegtest });

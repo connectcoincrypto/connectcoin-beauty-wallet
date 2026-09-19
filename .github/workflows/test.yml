@@ -48,6 +48,14 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 5
         run: xvfb-run --auto-servernum npm run test:ui:load
+      - name: Test RSA policy review and cancellation
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: xvfb-run --auto-servernum npm run test:ui:rsa
+      - name: Test RSA policy review and cancellation on native desktop
+        if: runner.os != 'Linux'
+        timeout-minutes: 5
+        run: npm run test:ui:rsa
       - name: Test locked wallet recovery and replacement
         if: runner.os == 'Linux'
         timeout-minutes: 5

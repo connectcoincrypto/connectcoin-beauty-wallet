@@ -16,6 +16,8 @@ A calmer home for ConnectCoin. **ConnectWallet is a desktop light wallet**: it k
 - Browse balances and transaction history, create receive addresses, export an encrypted backup and lock your wallet.
 - Use a light or dark interface. **System** is the default and follows your operating system automatically; override it in **Settings → Appearance**. Your choice is saved without interrupting Automatic Claims or reconnecting RPC.
 
+Before reviewing a P2C bounty, the wallet makes one bounded TLS capability check, without an HTTP request. A verified RSA handshake selects **mask 6** (the two supported RSA-PSS/SHA-256 schemes); an unavailable helper, failed check, busy worker or three-second timeout retains **mask 7** (ECDSA P-256/SHA-256 plus both RSA schemes), as in Core Qt. The review shows the result and the exact policy used by the signed transaction. Failure is not proof that the website lacks RSA, and retaining all schemes does not guarantee the bounty can be claimed. Success confirms one server's current capability, not future availability or every DNS endpoint. Cancelling the review or locking the wallet cancels the check; nothing is broadcast without confirmation.
+
 Automatic Claims are **off by default**, stop when the wallet locks, and are not resumed automatically after an unlock or app restart. Defaults are **100 connection starts per second and 100 simultaneous connections**; existing saved limits are preserved. Values over 100 show a warning; the local maximum is 256. The configurable discovery window is 1–600 recent blocks, matching the public API. These are network-intensive tasks, not CPU mining. Only interact with destinations you are authorized to test; rewards are not guaranteed, and other claimers may spend a bounty first.
 
 Automatic Claims use Core/Qt's economic criteria: **net payout after the claim fee × success probability**, with probability `(target + 1) / 2^256`. Each bounty receives one OS-backed cryptographic random multiplier between **1.0 and 1.1**, retained while it remains in the discovery catalog. The multiplier adjusts priority, not profitability checks; there is no shuffle or new lottery on every retry. Exact integer arithmetic orders bounties, independently of RPC pagination order.
@@ -87,6 +89,8 @@ The child key is used as a **native ConnectCoin x-only P2PK key**, with no Bitco
 
 Restoration scans both chains with a **20-unused-address gap**. Restored wallets continue watching that lookahead for later payments to previously issued, unused addresses. Creating receive addresses is bounded by the same gap. Discovery can take time because requests respect the public API's rate limits. This release has a 1,000-address safety limit per chain; it reports an error instead of silently claiming complete recovery beyond that limit. Keep the derivation convention with your offline backup. A BIP39 phrase alone does not make the wallet compatible with every other application's derivation scheme. This is not an importer for ConnectCoin Core's `wallet.dat`.
 
+Within the initial recovery refresh, fully exhausted empty histories may be reused while the exact chain-tip hash and RPC session remain unchanged. They are not persisted or reused by later refreshes. A payment entering the mempool after discovery may appear on the next refresh; these separate RPC reads are not an atomic snapshot of the mempool.
+
 The wallet-file password is **not a BIP39 passphrase** and does not change the addresses. This initial UI uses an empty BIP39 passphrase. Passwords must have at least 12 characters. The local encrypted file uses **scrypt (`N=131072, r=8, p=1`) and AES-256-GCM**, with a fresh 32-byte salt and 12-byte nonce. Format/KDF metadata is authenticated and KDF parameters are strictly bounded. Writes are atomic, and newly created files are restricted to the current OS account where supported. Windows also depends on your profile's access-control permissions.
 
 The recovery phrase bypasses the local password: anyone with it controls the keys. Write it offline; do not send it to support. On the locked screen, **Forgot password?** restores from your original 12, 18 or 24 words and sets a new local password. There is no password reset by email or support. The app cannot compare a phrase against a locked, encrypted wallet: another valid phrase opens a different wallet, not the original funds.
@@ -125,6 +129,8 @@ Automatic Claims writes `claims.progress` at most once every five seconds, with 
 
 Only allowlisted metadata and canonical error descriptions are recorded. Passwords, recovery words, private keys, addresses, transaction IDs/bytes, TLS proofs, arbitrary backend error text, helper stderr and RPC parameters are **not** written. Unknown errors use a generic description rather than copying potentially sensitive remote text. Logs remain on your device; nothing is uploaded automatically. Review them before sharing, since operation timing and error categories still describe wallet activity.
 
+TLS capture timeouts have their own fixed diagnostic description, distinct from generic capture/proof failures. This does not change connection deadlines, retry rules or successful-capture budgets. See the [helper protocol](helpers/PROTOCOL.md).
+
 Writes are asynchronous with a bounded queue and automatic rotation. If the disk or directory is unavailable, claiming continues and the panel reports the logging problem when Developer Mode is enabled; errors remain in bounded memory until the app closes. Diagnostics cannot recover warnings from versions that did not record them.
 
 ## Tests
@@ -133,6 +139,7 @@ Writes are asynchronous with a bounded queue and automatic rotation. If the disk
 npm run check
 npm test
 npm run test:ui
+npm run test:ui:rsa
 npm run test:ui:load
 npm run test:ui:recovery
 npm run setup:claims
@@ -144,7 +151,7 @@ The UI load test replays 1,000 progress updates with a 500-entry history and che
 
 The recovery UI test uses a temporary profile and loopback RPC fixture to check password recovery, wallet replacement, cancellation, invalid inputs, backup verification, byte-identical encrypted archives and unlocking after restart. Unit tests also cover concurrent writes, expired authorization, lock/close races and backup failures. These tests never replace a real user wallet or broadcast transactions.
 
-CI runs the unit and helper tests on Linux, Windows and macOS, plus the Electron UI smoke test on Linux under Xvfb. For a headless Linux machine, install the runtime dependencies with `npx playwright install-deps chromium`, then run `xvfb-run --auto-servernum npm run test:ui`. Playwright's Linux Electron test launcher supplies `--no-sandbox` by default: these automated tests exercise the UI, preload restrictions and wallet lifecycle, **not enforcement of the operating-system sandbox**. The normal application requests sandboxing and does not add this test flag; do not add it to normal wallet launches.
+CI runs the unit, helper and RSA review/locking UI tests on Linux, Windows and macOS. The full UI smoke, load and recovery tests also run on Linux under Xvfb. UI tests fail if graceful shutdown fails or exceeds its deadline; emergency cleanup targets only the spawned test process tree. For a headless Linux machine, install the runtime dependencies with `npx playwright install-deps chromium`, then run `xvfb-run --auto-servernum npm run test:ui`. Playwright's Linux Electron test launcher supplies `--no-sandbox` by default: these automated tests exercise the UI, preload restrictions and wallet lifecycle, **not enforcement of the operating-system sandbox**. The normal application requests sandboxing and does not add this test flag; do not add it to normal wallet launches.
 
 With an existing compatible ConnectCoin binary:
 

@@ -96,6 +96,10 @@ class ProgressReporter:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--probe-rsa"]:
+        deadline = time.monotonic() + 3.0
+        from rsa_probe import run_probe
+        return run_probe(sys.stdin.buffer, emit, ROOT / "p2c_roots_v1.pem", deadline=deadline)
     if sys.argv[1:] == ["--service"]:
         from claims_service import run_service
         return run_service(sys.stdin.buffer, emit, parse_context, ROOT / "p2c_roots_v1.pem")

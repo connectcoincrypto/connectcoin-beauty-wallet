@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_CONFIG } from '../src/core/config.mjs';
+import { closeElectronTest } from './ui-close.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-load-'));
@@ -154,12 +155,12 @@ try {
   assert.equal(await page.locator('#rpc-host').count(), 0);
   assert.deepEqual(errors, []);
   passed = true;
-  console.log(`PASS: isolated renderer load, 500 history rows, 1000-update burst (${measurements.burstMs} ms; ${measurements.shellReplacements} shell replacements), 1000 transient errors (${measurements.errorReplacements} replacements), held-pointer navigation, scroll/draft/focus retention, unchanged-page DOM identity, immediate lock over pending progress. No wallet or RPC used.`);
 } catch (error) {
   console.error(`UI load test failed during ${stage}: ${error.stack ?? error}`);
   process.exitCode = 1;
 } finally {
-  await application?.close().catch(() => {});
+  try { Object.assign(measurements, await closeElectronTest(application)); }
+  catch { passed = false; process.exitCode = 1; console.error('Load UI graceful shutdown failed.'); }
   // Only remove the exact temporary profile created above, never user data.
   const absolute = path.resolve(profile);
   assert.equal(path.dirname(absolute), path.resolve(tmpdir()));
@@ -167,3 +168,4 @@ try {
   await rm(absolute, { recursive: true, force: true });
   if (!passed) console.error(`Load metrics: ${JSON.stringify(measurements)}`);
 }
+if (passed) console.log(`PASS: isolated renderer load, 500 history rows, 1000-update burst (${measurements.burstMs} ms; ${measurements.shellReplacements} shell replacements), 1000 transient errors (${measurements.errorReplacements} replacements), held-pointer navigation, scroll/draft/focus retention, unchanged-page DOM identity, immediate lock over pending progress and graceful shutdown (${measurements.closeMs} ms). No wallet or RPC used.`);

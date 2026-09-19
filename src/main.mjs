@@ -10,7 +10,7 @@ const INDEX = join(ROOT, 'ui', 'index.html');
 const UI_URL = pathToFileURL(INDEX).href;
 const ICON = join(ROOT, '..', 'assets', 'icon.png');
 const ICON_URL = pathToFileURL(ICON).href;
-const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','confirmSend','newAddress','getRecoveryPhrase','saveConfig','setTheme','setDeveloperMode','setClaims','refresh']);
+const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','cancelSendPreview','confirmSend','newAddress','getRecoveryPhrase','saveConfig','setTheme','setDeveloperMode','setClaims','refresh']);
 const EXTERNAL = new Set(['https://connectcoincrypto.com/','https://connectcoincrypto.com/whitepaper.pdf','https://explorer.connectcoincrypto.com/','https://github.com/connectcoincrypto/connectcoin-connect-wallet','https://github.com/connectcoincrypto/connectcoin','https://discord.gg/JYWbz5PsPp']);
 let window, service, quitting = false, actionInProgress = false;
 const themeBackground = () => nativeTheme.shouldUseDarkColors ? '#17151e' : '#f7f6f2';
@@ -89,8 +89,10 @@ else {
         if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== UI_URL) throw new Error('Untrusted wallet window.');
         if (typeof method !== 'string' || !payload || typeof payload !== 'object' || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > 16384) throw new Error('Invalid wallet action.');
         if (method === 'getState') return { ok:true,value:service.getState() };
-        // Lock can interrupt pending network/KDF work; other mutations are serialized.
+        // Lock and review cancellation can interrupt pending work; other
+        // mutations remain serialized (in particular, no parallel broadcasts).
         if (method === 'lock') return { ok:true,value:await service.lock() };
+        if (method === 'cancelSendPreview') return { ok:true,value:service.cancelSendPreview() };
         if (actionInProgress) throw new Error('Another wallet action is in progress. Please wait.');
         actionInProgress = true; service.activity();
         try {

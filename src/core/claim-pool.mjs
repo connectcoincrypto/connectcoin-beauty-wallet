@@ -11,6 +11,10 @@ export function validateConnectionOptions(input = {}) {
 }
 export function claimAborted() { return Object.assign(new Error('Automatic Claims stopped'), { name: 'AbortError' }); }
 const MAX_COUNTER = (1n << 64n) - 1n;
+const ATTEMPT_MESSAGES = new Set([
+  'TLS capture cancelled', 'TLS connection timed out',
+  'TLS capture or proof validation failed', 'Public DNS resolution is required',
+]);
 function counter(value) {
   if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,19})$/.test(value) || BigInt(value) > MAX_COUNTER) throw new Error('Invalid helper connection counter');
   return value;
@@ -103,7 +107,11 @@ export class ConnectionPool {
       if (this.started || message.protocol !== 3 || message.roots !== 1) throw new Error('Incompatible claims helper; update or rebuild it');
       this.started = true; clearTimeout(this.startTimer); this.readyResolve(); return;
     }
-    if (message.type === 'error') throw new Error(typeof message.message === 'string' ? message.message.slice(0, 500) : 'Claims helper failed');
+    if (message.type === 'error') throw new Error('Claims helper failed');
+    // Protocol 3 keeps its optional message field, but only fixed descriptions
+    // may reach the claims engine/UI. Older helpers' generic failures still work.
+    if (Object.hasOwn(message, 'message')) message = { ...message,
+      message: ATTEMPT_MESSAGES.has(message.message) ? message.message : 'TLS capture or proof validation failed' };
     if (!Number.isSafeInteger(message.id)) throw new Error('Invalid helper request identity');
     const request = this.requests.get(message.id);
     if (!request) throw new Error('Unexpected or duplicate helper response');

@@ -16,6 +16,19 @@ DNS failures and cancelled queued attempts do not create TLS observations.
 The legacy one-shot generator retains bounded snapshots for development tooling;
 it is not the desktop scheduling path. Proof encoding and verification are unchanged.
 
+The local `--probe-rsa` mode follows Core's `ProbeP2CRsaForTest` in
+`src/wallet/p2c_tls.cpp`: one public endpoint on port 443, RSA mask 6, the pinned
+version-1 roots, and certificate validation at the supplied wall-clock time.
+It completes TLS 1.3, verifies Server Finished and sends Client Finished before
+reporting authenticated RSA capability. This is an opt-in extension to `tls13.py`;
+claim capture still ends at CertificateVerify. The probe uses a random dummy
+transaction ID solely to reuse the challenge/proof verifier, and a maximum work
+target; no wallet transaction or keys enter the process and no HTTP is sent.
+Its three-second monotonic deadline includes input, roots, DNS, TLS and verification.
+A daemon resolver cannot hold up process exit; the desktop also enforces a
+three-second deadline including process startup. Only a fixed, bounded result
+is emitted; network and certificate error text is suppressed.
+
 `p2c_roots_v1.pem` is the immutable Mozilla-derived consensus trust bundle from
 ConnectCoin Core. Its SHA-256 is
 `f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9`.

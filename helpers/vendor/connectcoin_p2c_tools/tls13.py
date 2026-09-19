@@ -40,6 +40,7 @@ CONTENT_CHANGE_CIPHER_SPEC = 20
 CONTENT_ALERT = 21
 CONTENT_HANDSHAKE = 22
 CONTENT_APPLICATION_DATA = 23
+FINISHED = 20
 
 EXT_SERVER_NAME = 0
 EXT_SUPPORTED_GROUPS = 10
@@ -262,14 +263,15 @@ def derive_secret(secret: bytes, label: bytes, transcript: bytes) -> bytes:
     return hkdf_expand_label(secret, label, hashlib.sha256(transcript).digest(), 32)
 
 
-def derive_server_handshake_keys(
-    shared_secret: bytes, transcript: bytes, cipher_suite: int
-) -> tuple[bytes, bytes]:
+def _handshake_traffic_secret(shared_secret: bytes, transcript: bytes, label: bytes) -> bytes:
     zeroes = b"\x00" * 32
     early_secret = hkdf_extract(zeroes, zeroes)
     derived_secret = derive_secret(early_secret, b"derived", b"")
     handshake_secret = hkdf_extract(derived_secret, shared_secret)
-    traffic_secret = derive_secret(handshake_secret, b"s hs traffic", transcript)
+    return derive_secret(handshake_secret, label, transcript)
+
+
+def _handshake_keys(traffic_secret: bytes, cipher_suite: int) -> tuple[bytes, bytes]:
     if cipher_suite == TLS_AES_128_GCM_SHA256:
         key_length = 16
     elif cipher_suite == TLS_CHACHA20_POLY1305_SHA256:
@@ -280,6 +282,37 @@ def derive_server_handshake_keys(
         hkdf_expand_label(traffic_secret, b"key", b"", key_length),
         hkdf_expand_label(traffic_secret, b"iv", b"", 12),
     )
+
+
+def derive_server_handshake_keys(
+    shared_secret: bytes, transcript: bytes, cipher_suite: int
+) -> tuple[bytes, bytes]:
+    return _handshake_keys(
+        _handshake_traffic_secret(shared_secret, transcript, b"s hs traffic"), cipher_suite
+    )
+
+
+def _finished_verify_data(traffic_secret: bytes, transcript: bytes) -> bytes:
+    finished_key = hkdf_expand_label(traffic_secret, b"finished", b"", 32)
+    return hmac.new(finished_key, hashlib.sha256(transcript).digest(), hashlib.sha256).digest()
+
+
+def _verify_server_finished(message: bytes, traffic_secret: bytes, transcript: bytes) -> None:
+    expected = _handshake(FINISHED, _finished_verify_data(traffic_secret, transcript))
+    if not hmac.compare_digest(message, expected):
+        raise TLSGenerationError("TLS 1.3 server Finished verification failed")
+
+
+def _client_finished_record(
+    traffic_secret: bytes, transcript: bytes, cipher_suite: int
+) -> bytes:
+    # Client handshake sequence starts at zero; no application data is sent.
+    plaintext = _handshake(FINISHED, _finished_verify_data(traffic_secret, transcript))
+    plaintext += bytes([CONTENT_HANDSHAKE])
+    header = bytes([CONTENT_APPLICATION_DATA]) + _u16(TLS_1_2) + _u16(len(plaintext) + 16)
+    key, iv = _handshake_keys(traffic_secret, cipher_suite)
+    cipher = AESGCM(key) if cipher_suite == TLS_AES_128_GCM_SHA256 else ChaCha20Poly1305(key)
+    return header + cipher.encrypt(_record_nonce(iv, 0), plaintext, header)
 
 
 def _remaining_timeout(deadline: float) -> float:
@@ -449,6 +482,7 @@ def capture_tls13_proof(
     control: CaptureControl | None = None,
     on_started: Callable[[], None] | None = None,
     before_start: Callable[[], None] | None = None,
+    complete_handshake: bool = False,
 ) -> TLSProofMessages:
     validate_signature_algorithms_mask(signature_algorithms_mask)
     if not math.isfinite(timeout) or timeout <= 0:
@@ -512,6 +546,8 @@ def capture_tls13_proof(
 
         encrypted_handshake = bytearray()
         expected_messages = (ENCRYPTED_EXTENSIONS, CERTIFICATE, CERTIFICATE_VERIFY)
+        if complete_handshake:
+            expected_messages += (FINISHED,)
         captured: list[bytes] = []
         sequence = 0
         while len(captured) < len(expected_messages):
@@ -545,6 +581,20 @@ def capture_tls13_proof(
                         f"expected TLS handshake type {expected_type}, received {message[0]}"
                     )
                 captured.append(message)
+
+        if complete_handshake:
+            if encrypted_handshake:
+                raise TLSGenerationError("unexpected handshake data after server Finished")
+            hello_transcript = client_hello + server_hello
+            transcript = hello_transcript + b"".join(captured[:3])
+            server_secret = _handshake_traffic_secret(shared_secret, hello_transcript, b"s hs traffic")
+            _verify_server_finished(captured[3], server_secret, transcript)
+            client_secret = _handshake_traffic_secret(shared_secret, hello_transcript, b"c hs traffic")
+            if control is not None and control.cancelled():
+                raise CaptureCancelled("TLS capture cancelled")
+            connection.settimeout(_remaining_timeout(deadline))
+            connection.sendall(_client_finished_record(client_secret, transcript + captured[3], cipher_suite))
+            _remaining_timeout(deadline)
 
     result = TLSProofMessages(
         client_hello=client_hello,

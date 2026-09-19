@@ -15,7 +15,7 @@ from connectcoin_p2c_tools.domain import is_canonical_domain
 from connectcoin_p2c_tools.generator import resolve_endpoints
 from connectcoin_p2c_tools.hashes import meets_work_target
 from connectcoin_p2c_tools.protocol import parse_proof
-from connectcoin_p2c_tools.tls13 import CaptureCancelled, CaptureControl, capture_tls13_proof
+from connectcoin_p2c_tools.tls13 import CaptureCancelled, CaptureControl, TLSGenerationError, capture_tls13_proof
 from connectcoin_p2c_tools.verify import validate_root_bundle, verify_connection_proof
 
 MAX_PENDING = 512
@@ -317,6 +317,15 @@ class ClaimsService:
             blocked = "budget"
         except CaptureCancelled:
             message = "TLS capture cancelled"
+        except (TimeoutError, TLSGenerationError) as error:
+            # Socket timeouts and the capture's absolute deadline share one safe
+            # description. Match only the provider's fixed local deadline error;
+            # never forward arbitrary TLS/peer exception text to the desktop.
+            timed_out = isinstance(error, TimeoutError) or error.args == ("TLS handshake exceeded the connection timeout",)
+            if not job.started:
+                message = "Public DNS resolution is required"
+            else:
+                message = "TLS connection timed out" if timed_out else "TLS capture or proof validation failed"
         except Exception:
             # Never echo certificates, raw socket errors, remote data or proof
             # contents in operational messages.

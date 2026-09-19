@@ -18,7 +18,7 @@ class IsolatedRuntimeTests(unittest.TestCase):
             # Neither cwd, PYTHONPATH, nor user-site hooks may supply helper
             # modules. Poison files make loss of -I or a cwd import observable.
             poison = Path(directory)
-            for name in ("claims_service.py", "sitecustomize.py", "usercustomize.py"):
+            for name in ("claims_service.py", "rsa_probe.py", "sitecustomize.py", "usercustomize.py"):
                 (poison / name).write_text("raise RuntimeError('untrusted import')\n", encoding="utf-8")
             package = poison / "connectcoin_p2c_tools"
             package.mkdir()
@@ -54,6 +54,19 @@ class IsolatedRuntimeTests(unittest.TestCase):
         frames = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(len(frames), 1)
         self.assertEqual(frames[0]["type"], "error")
+
+    def test_rsa_probe_uses_trusted_import_and_sanitizes_invalid_input(self):
+        result = self.invoke(["--probe-rsa"], '{"domain":"private.local","rootVersion":1,"validationTime":1800000000}\n')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout), {
+            "type": "error", "message": "Invalid or incomplete RSA probe request."})
+
+    def test_unknown_rsa_probe_arguments_do_not_start_work(self):
+        result = self.invoke(["--probe-rsa", "--unsafe"])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout)["type"], "error")
 
 
 if __name__ == "__main__":

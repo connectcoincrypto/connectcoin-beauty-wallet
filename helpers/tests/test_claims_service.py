@@ -19,7 +19,7 @@ sys.path.insert(0, str(HELPERS))
 import claims_bridge
 import claims_service as service
 from connectcoin_p2c_tools.errors import ProofVerificationError
-from connectcoin_p2c_tools.tls13 import CaptureCancelled, CaptureControl, Endpoint, capture_tls13_proof
+from connectcoin_p2c_tools.tls13 import CaptureCancelled, CaptureControl, Endpoint, TLSGenerationError, capture_tls13_proof
 
 
 def public_context(**changes):
@@ -277,6 +277,67 @@ class ServiceTests(unittest.TestCase):
                 self.assertTrue(result["started"])
                 self.assertFalse(result["captured"])
                 self.assertEqual(result["successfulConnections"], "0")
+
+    def test_capture_failure_messages_are_fixed_and_timeouts_preserve_budget(self):
+        for error, expected in (
+            (TimeoutError("private socket details"), "TLS connection timed out"),
+            (TLSGenerationError("TLS handshake exceeded the connection timeout"), "TLS connection timed out"),
+            (TLSGenerationError("private peer timed out"), "TLS capture or proof validation failed"),
+            (OSError("private peer timed out"), "TLS capture or proof validation failed"),
+        ):
+            with self.subTest(error=type(error).__name__, expected=expected), Fixture() as h:
+                h.resolve_domain()
+                def fails(*args, **kwargs):
+                    fake_capture(*args, **kwargs)
+                    raise error
+                h.capture.side_effect = fails
+                h.attempt(2, successes="2")
+                result = h.wait("attempt", 2)
+                self.assertEqual(result["message"], expected)
+                self.assertTrue(result["started"])
+                self.assertFalse(result["captured"] or result["cancelled"] or result["verified"])
+                self.assertIsNone(result["proof"])
+                self.assertEqual(result["successfulConnections"], "2")
+                self.assertNotIn("private", json.dumps(h.frames))
+                h.capture.side_effect = fake_capture
+                h.attempt(3, successes="2")
+                retry = h.wait("attempt", 3)
+                self.assertTrue(retry["verified"])
+                self.assertEqual(retry["successfulConnections"], "3")
+
+    def test_real_tls_deadline_is_reported_as_timeout_without_remote_text(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0)); listener.listen(1); listener.settimeout(3)
+        address = listener.getsockname()
+        received, release = threading.Event(), threading.Event()
+        def peer():
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(3)
+                    connection.recv(4096)
+                    received.set()
+                    release.wait(3)
+            finally:
+                listener.close()
+        server_thread = threading.Thread(target=peer)
+        server_thread.start()
+        try:
+            with patch.object(service, "CONNECTION_TIMEOUT", 0.1), Fixture() as h:
+                h.resolve.return_value = (Endpoint(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, address, "127.0.0.1"),)
+                h.capture.side_effect = capture_tls13_proof
+                h.resolve_domain()
+                h.attempt(2)
+                result = h.wait("attempt", 2)
+                self.assertTrue(received.is_set())
+                self.assertEqual(result["message"], "TLS connection timed out")
+                self.assertEqual([frame["type"] for frame in h.frames if frame.get("id") == 2], ["started", "capture", "attempt"])
+                self.assertFalse(result["captured"] or result["cancelled"] or result["verified"])
+                self.assertEqual(result["successfulConnections"], "0")
+                self.assertGreaterEqual(result["seconds"], 0.1)
+                self.assertLess(result["seconds"], 2)
+        finally:
+            release.set(); server_thread.join(4)
 
     def test_global_start_rate_is_shared_across_domains(self):
         times = []

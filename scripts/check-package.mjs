@@ -24,4 +24,24 @@ await new Promise((accept, reject) => {
 const pool = new ConnectionPool({ helper: { command: helper, args: [] } });
 try { await pool.start({}); }
 finally { await pool.close(); }
-console.log('Native protocol-3 helper and desktop assets verified for packaging.');
+// An older protocol-3 helper lacks RSA probing. Exercise the new mode with an
+// invalid request so packaging cannot silently ship it; no DNS/TLS is attempted.
+await new Promise((accept, reject) => {
+  const child = spawn(helper, ['--probe-rsa'], { cwd: root, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
+  let output = '', bytes = 0, failed = false;
+  const fail = () => { failed = true; child.kill(); reject(new Error('Bundled helper lacks the RSA probe. Run npm run build:claims.')); };
+  child.once('error', fail);
+  child.stdin.on('error', fail);
+  child.stdout.on('data', chunk => { bytes += chunk.length; if (bytes > 4096) fail(); else output += chunk.toString('utf8'); });
+  child.stderr.on('data', chunk => { bytes += chunk.length; if (bytes > 4096) fail(); });
+  child.once('close', code => {
+    if (failed) return;
+    try {
+      const reply = JSON.parse(output);
+      if (code !== 1 || reply.type !== 'error' || reply.message !== 'Invalid or incomplete RSA probe request.') return fail();
+      accept();
+    } catch { fail(); }
+  });
+  child.stdin.end('{}\n');
+});
+console.log('Native protocol-3 helper, RSA probe and desktop assets verified for packaging.');

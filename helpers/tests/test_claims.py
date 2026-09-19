@@ -25,7 +25,7 @@ from connectcoin_p2c_tools.tls13 import Endpoint, capture_tls13_proof
 from connectcoin_p2c_tools.verify import ROOTS_V1_SHA256, verify_connection_proof
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 
@@ -37,7 +37,7 @@ def request():
                         "overallTimeout": 180, "maxAttempts": 1000}}
 
 
-def identity():
+def identity(*, rsa_leaf=False, leaf_domain="example.com"):
     root_key = ec.generate_private_key(ec.SECP256R1())
     root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ConnectWallet test root")])
     root = (x509.CertificateBuilder().subject_name(root_name).issuer_name(root_name)
@@ -48,14 +48,15 @@ def identity():
             .add_extension(x509.KeyUsage(True, False, False, False, False, True, True, None, None), True)
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(root_key.public_key()), False)
             .sign(root_key, hashes.SHA256()))
-    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_key = (rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                if rsa_leaf else ec.generate_private_key(ec.SECP256R1()))
     leaf = (x509.CertificateBuilder().subject_name(x509.Name([
                 x509.NameAttribute(NameOID.COMMON_NAME, "example.com")]))
             .issuer_name(root_name).public_key(leaf_key.public_key()).serial_number(2)
             .not_valid_before(datetime(2025, 1, 1, tzinfo=UTC))
             .not_valid_after(datetime(2035, 1, 1, tzinfo=UTC))
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
-            .add_extension(x509.SubjectAlternativeName([x509.DNSName("example.com")]), False)
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(leaf_domain)]), False)
             .add_extension(x509.KeyUsage(True, False, False, False, False, False, False, None, None), True)
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()), False)

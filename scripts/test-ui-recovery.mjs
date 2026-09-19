@@ -9,8 +9,10 @@ import path from 'node:path';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { GENESIS } from '../src/core/config.mjs';
+import { deriveAccount } from '../src/core/crypto.mjs';
 import { createVault, unlockVault } from '../src/core/vault.mjs';
 import { waitForUiCondition } from './ui-wait.mjs';
+import { closeElectronTest } from './ui-close.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-recovery-'));
@@ -24,6 +26,7 @@ const newPassword = 'Recovery-test-replacement-password';
 const createdPassword = 'Recovery-test-new-wallet-password';
 const tip = { chain: 'testnet4', height: 0, hash: GENESIS.testnet4, genesis_hash: GENESIS.testnet4, mediantime: 1780000000 };
 const requests = [];
+const historyAddresses = [];
 const sockets = new Set();
 const fixture = net.createServer(socket => {
   sockets.add(socket);
@@ -38,6 +41,7 @@ const fixture = net.createServer(socket => {
       const { method, id, params = {} } = JSON.parse(buffer.slice(0, end));
       buffer = buffer.slice(end + 1);
       requests.push(method);
+      if (method === 'getaddresshistory') historyAddresses.push(params.address);
       let result;
       if (method === 'getchaintip') result = tip;
       else if (method === 'getaddressbalance') result = { tip, address: params.address, unit: 'connects', confirmed: '0', available_confirmed: '0', pending_delta: '0', immature: '0' };
@@ -80,13 +84,12 @@ async function launch() {
   page.on('pageerror', error => errors.push(error.name));
 }
 async function ready() {
-  // Recovery needs up to 80 history calls: 40 for discovery and 40 for refresh.
-  // The real 48-per-minute quota requires one full 60-second window; allow at
-  // most 90 seconds including KDF/UI overhead. Keep the complete !busy check.
+  // Both real 20-address gaps fit in the unchanged 48-per-minute RPC quota.
+  // Empty discovery pages must not be fetched twice during this same refresh.
   await waitForUiCondition(page, async () => {
     const state = await window.connectwallet.invoke('getState');
     return state.phase === 'unlocked' && state.network.status === 'online' && !state.busy && !state.wallet.recovering;
-  }, null, { timeout: 90000, message: 'The isolated recovery and its quota-paced refresh must finish.' });
+  }, null, { timeout: 20000, message: 'The isolated recovery must finish within one history quota window.' });
   await page.waitForFunction(() => document.querySelector('#app')?.getAttribute('aria-busy') !== 'true');
   return page.evaluate(() => window.connectwallet.invoke('getState'));
 }
@@ -209,9 +212,16 @@ try {
   await begin('recover');
   await fillRestore(mnemonic, newPassword);
   await page.getByRole('button', { name: 'Restore wallet and reset password' }).click();
-  assert.equal((await ready()).wallet.address, originalAddress);
-  assert.ok(requests.filter(method => method === 'getaddresshistory').length - historyBeforeRecovery >= 80,
-    'Recovery must still discover both 20-address gaps and refresh the complete lookahead through real RPC.');
+  const recoveredState = await ready();
+  assert.equal(recoveredState.wallet.address, originalAddress);
+  assert.equal(recoveredState.wallet.addressCount, 40);
+  const expectedLookahead = [];
+  for (const change of [0, 1]) for (let index = 0; index < 20; index++) {
+    const account = deriveAccount(mnemonic, { network: 'testnet4', change, index });
+    account.privateKey.fill(0); expectedLookahead.push(account.address);
+  }
+  assert.deepEqual(historyAddresses.slice(historyBeforeRecovery).sort(), [...expectedLookahead].sort(),
+    'Recovery must discover both complete 20-address gaps exactly once through real RPC.');
   assert.equal(await page.locator('#restore-phrase, .seed-word').count(), 0);
   await lock();
   const firstBackups = await archives();
@@ -221,9 +231,12 @@ try {
   assert.equal((await unlockVault(firstBackup, oldPassword)).mnemonic, mnemonic);
   await assert.rejects(unlockVault(vaultFile, oldPassword));
   assert.equal((await unlockVault(vaultFile, newPassword)).mnemonic, mnemonic);
+  const historyBeforeUnlock = historyAddresses.length;
   await page.locator('#unlock-password').fill(newPassword);
   await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
   assert.equal((await ready()).wallet.address, originalAddress);
+  assert.deepEqual(historyAddresses.slice(historyBeforeUnlock).sort(), [...expectedLookahead].sort(),
+    'The next unlock refresh must check every lookahead address again; recovery emptiness is never persisted.');
   await lock();
   const recoveredBytes = await readFile(vaultFile);
 
@@ -263,7 +276,7 @@ try {
   assert.equal((await unlockVault(vaultFile, createdPassword)).mnemonic, createdWords.join(' '));
 
   nextStage('relaunch with new wallet and encrypted storage only');
-  await application.close(); application = null;
+  await closeElectronTest(application); application = null;
   await launch();
   await page.locator('#unlock-password').waitFor();
   assert.equal(await page.getByRole('button', { name: 'Forgot password?', exact: true }).isVisible(), true);
@@ -282,7 +295,6 @@ try {
   assert.ok(!requests.includes('sendrawtransaction'));
   nextStage('finished');
   passed = true;
-  console.log(`PASS: isolated Electron locked recovery/switch controls, acknowledgement gates, cancellation, invalid phrases/password confirmation, verified new seed, same-address password recovery, byte-exact encrypted archives, relaunch persistence and no broadcasts. Non-secret screenshots: ${screenshots}`);
 } catch (error) {
   // Never emit Playwright action dumps, secrets, page HTML or seed screenshots.
   const line = /test-ui-recovery\.mjs:(\d+):\d+/.exec(String(error.stack ?? ''))?.[1];
@@ -294,7 +306,11 @@ try {
   process.exitCode = 1;
 } finally {
   createdWords.fill(''); createdWords = [];
-  await application?.close().catch(() => {});
+  try { await closeElectronTest(application); }
+  catch {
+    passed = false; process.exitCode = 1;
+    console.error('Recovery UI graceful shutdown failed. The temporary profile was preserved; no wallet data was logged.');
+  }
   for (const socket of sockets) socket.destroy();
   await new Promise(resolve => fixture.close(resolve));
   if (passed) {
@@ -304,3 +320,4 @@ try {
     await rm(absolute, { recursive: true, force: true });
   }
 }
+if (passed) console.log(`PASS: isolated Electron locked recovery/switch controls, acknowledgement gates, cancellation, invalid phrases/password confirmation, verified new seed, same-address password recovery, byte-exact encrypted archives, relaunch persistence and no broadcasts. Non-secret screenshots: ${screenshots}`);
